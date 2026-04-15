@@ -1,0 +1,14 @@
+{
+  "base_url": "https://evclinic.eu",
+  "index_pages": [
+    "https://evclinic.eu/",
+    "https://evclinic.eu/page/2/",
+    "https://evclinic.eu/page/3/",
+    "https://evclinic.eu/page/4/"
+  ],
+  "article_selector": "a.tpg-post-link",
+  "title_selector": "h1",
+  "content_selector": "div.futurio-content.single-content",
+  "image_selector": "figure img",
+  "category_selector": "span.categories-links a"
+}

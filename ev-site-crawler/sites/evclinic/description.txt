@@ -1,0 +1,6 @@
+EVClinic (evclinic.eu) - notes
+
+This directory contains a small config-driven crawler for the EVClinic site.
+The `config.json` file contains CSS selectors used by the crawler.
+
+Do not use this file in code logic.
