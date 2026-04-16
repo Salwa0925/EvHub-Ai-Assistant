@@ -1,12 +1,6 @@
 # Virtual environment
 .venv/
 
-# Generated output
-data/
-
-# PDF manuals
-manuals/
-
 # Environment variables
 .env
 
