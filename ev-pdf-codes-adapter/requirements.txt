@@ -1,0 +1,5 @@
+
+Python3
+fitz(pymupdf, anthropic(not implemented yet)
+pymongo(not there yet, but considering)
+psycopg2(or others if we decide to use postgresql)
