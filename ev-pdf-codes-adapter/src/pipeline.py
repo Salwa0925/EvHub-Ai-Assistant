@@ -35,12 +35,12 @@ def main():
     print(f"Found {len(pdf_files)} PDF(s) to process")
 
 
-    # ── Set up output directory ───────────────────────────────────────────────
-    # All output (JSON + images) goes into the data/ folder.
+    # ── Set up base output directory ───────────────────────────────────────────────
+    # All output (JSON + images) goes into the data/ - each PDF gets its own subfolder inside it
     # We define it here so we can pass it to extract_records,
     # which will use it to save image files to disk.
-    out_dir = Path("data")
-    out_dir.mkdir(exist_ok=True)  # create the data/ folder if it doesn't exist yet
+    base_dir = Path("data")
+    base_dir.mkdir(exist_ok=True)  # create the data/ folder if it doesn't exist yet
 
     # ── Process each PDF ───────────────────────────────────────────────────
     # we loop through every pdf file found in manuals/
@@ -48,13 +48,19 @@ def main():
     for pdf_path in pdf_files:
         print(f"\nProcessing: {pdf_path.name}")
 
-        # ── Skip already processed PDFs───────────────────────────────────────
-        # build the expected output path for this pdf - e.g data/EVB.json
+        # Create a subfolder named after the PDF — e.g. data/EVB/
+        # Each PDF gets its own folder so files never overwrite each other
+        out_dir = base_dir / pdf_path.stem
+        out_dir.mkdir(exist_ok=True)
+
+        # ── Skip already processed PDFs ───────────────────────────────────────
+        # Check if the JSON already exists inside the subfolder
         out_path = out_dir / f"{pdf_path.stem}.json"
         if out_path.exists():
             print(f"  Already processed - skipping.")
             continue
-        records = extract_records(pdf_path, output_dir=out_dir) 
+        records = extract_records(pdf_path, output_dir=out_dir)
+
 
         if not records:
             print("No records extracted - skipping.")
