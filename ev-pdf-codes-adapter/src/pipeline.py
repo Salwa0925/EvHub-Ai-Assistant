@@ -59,35 +59,55 @@ def main():
         if out_path.exists():
             print(f"  Already processed - skipping.")
             continue
-        records = extract_records(pdf_path, output_dir=out_dir)
 
+        # ── Try to process — skip and log if anything goes wrong ─────────────
+        # try/except means: attempt the code inside try — if ANY error occurs,
+        # jump to except instead of crashing the whole program.
+        # This way one bad PDF never kills the rest of the run.
+        try:
+            records = extract_records(pdf_path, output_dir=out_dir)
 
-        if not records:
-            print("No records extracted - skipping.")
-            continue
+            if not records:
+                print("  No records extracted - skipping.")
+                continue
 
-        # ── Save JSON output ──────────────────────────────────────────────────────
-        # each pdf gets its own json file in data/, named after the pdf but with .json extension
-        
-        with open(out_path, 'w', encoding="utf-8") as f:
-            json.dump(records, f, indent=2, ensure_ascii=False)
-        print(f" Saved {len(records)} records to {out_path}")
+            # ── Atomic JSON write ─────────────────────────────────────────────
+            # We write to a temporary file first (.json.tmp).
+            # Only when the write is fully complete do we rename it to .json.
+            # If the program crashes mid-write, the .tmp file is left behind
+            # and .json is never created — so the next run will reprocess correctly.
+            tmp_path = out_path.with_suffix(".json.tmp")   # e.g. data/EVB/EVB.json.tmp
 
-        # ── Quality report ────────────────────────────────────────────────────────
-        missing_text = [r for r in records if not r["content"]["text"].strip()]
-        all_images = set()
-        for r in records:
-            all_images.update(r["content"]["images"])
-        total_images = len(all_images)
+            with open(tmp_path, 'w', encoding="utf-8") as f:
+                json.dump(records, f, indent=2, ensure_ascii=False)
 
-        print(f"  Quality report:")
-        print(f"   Total records  : {len(records)}")
-        print(f"   Missing content: {len(missing_text)}")
-        print(f"   Images saved   : {total_images}")
+            tmp_path.rename(out_path)   # instant rename — cannot be interrupted halfway
 
-        if missing_text:
-            for r in missing_text[:5]:  # show up to 5 records with missing text
-                print(f"   {r['dtc']} -> page {r['page']} has no content")
+            print(f"  Saved {len(records)} records to {out_path}")
+
+            # ── Quality report ────────────────────────────────────────────────
+            # Check for pages where no text was extracted
+            missing_text = [r for r in records if not r["text"].strip()]
+
+            # Collect all unique image filenames across all page records
+            all_images = set()
+            for r in records:
+                all_images.update(r["images"])   # r["images"] is a list — update adds each item to the set
+            total_images = len(all_images)
+
+            print(f"  Quality report:")
+            print(f"   Total pages    : {len(records)}")
+            print(f"   Missing text   : {len(missing_text)}")
+            print(f"   Images saved   : {total_images}")
+
+            if missing_text:
+                for r in missing_text[:5]:   # show up to 5 pages with missing text
+                    print(f"   page {r['page']} ({r['dtc_mentions']}) has no text")
+
+        except Exception as e:
+            # Something went wrong with this PDF — print the error and move on.
+            # The .json file was never written (atomic write), so next run will retry.
+            print(f"  ERROR processing {pdf_path.name}: {e}")
 
 
 if __name__ == "__main__":
