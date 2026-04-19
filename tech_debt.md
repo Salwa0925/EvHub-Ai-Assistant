@@ -27,22 +27,25 @@ Hardcoded folder path in pdf_detector.py
 - Fix: read the path from a config file or environment variable.
 - Priority: Low — this file is a utility script, not part of the main pipeline.
 
-## Item 4 — No skip logic for already-processed PDFs:
+## Item 4 — No skip logic for already-processed PDFs: ✅ RESOLVED
 No skip logic — pipeline re-processes files it already ran
 - File: src/pipeline.py
 - Problem: running the pipeline twice on the same PDF overwrites the JSON
   and re-saves all images. Wastes time and could cause duplicate records later
   when we add the database importer.
 - Fix: check if output JSON already exists before processing. Skip if found.
-- Priority: High — needed before we run this on the full manuals folder.
+- Priority: High — DONE. Skip logic added to pipeline.py.
 
-## Item 5 — No error handling around image extraction:
+## Item 5 — No error handling around image extraction: ⚠️ PARTIALLY RESOLVED
 Image extraction has no error handling
 - File: src/extractor.py — extract_content(), image loop
 - Problem: if pdf.extract_image(xref) fails (corrupt image, unsupported format),
   the whole run crashes and no output is saved.
-- Fix: wrap in try/except, log the failure, and continue.
-- Priority: Medium — will hit this eventually with real-world messy PDFs.
+- Fix applied: try/except added at pipeline level — one bad PDF no longer kills the run.
+- Remaining: the image loop inside extract_content() still has no per-image try/except.
+  One bad image inside a PDF can still crash that PDF's extraction.
+- Fix remaining: wrap the image loop body in try/except, log and skip bad images.
+- Priority: Medium — will hit this with real-world messy PDFs.
 
 ## Item 6 — print() used instead of proper logging:
 print() used throughout instead of Python logging
@@ -52,13 +55,16 @@ print() used throughout instead of Python logging
 - Fix: replace with Python's built-in logging module.
 - Priority: Low — fine for now, needed before production.
 
-## Item 7 — Table data stored as raw text instead of structured fields
+## Item 7 — Table data stored as raw text instead of structured fields: 🔀 APPROACH CHANGED
 Table data is stored as raw text instead of structured fields
 - File: `src/extractor.py`
-- Problem: table content is flattened into `content.text`, so row/column relationships are lost. Shared table values, such as one detecting condition applying to multiple DTC rows, are only implied by the page text.
-- - Why it matters: this makes semantic search and LLM answering less reliable, because the model has to infer table structure instead of reading explicit field mappings. It can also increase duplication and make output less efficient as more manuals are processed.
-- Fix: store one structured JSON record per DTC with explicit fields for diagnosis name, detecting condition, and possible causes. Keep raw page text as fallback context.
-- Priority: High — needed for accurate retrieval and structured downstream use.
+- Problem: table content is flattened into page text, so row/column relationships are lost.
+- Approach update: structured field extraction (diagnosis name, detecting condition,
+  possible causes) is now confirmed as the responsibility of the enrichment layer —
+  not this ETL pipeline. AWS Bedrock (or equivalent LLM) will read the raw page text
+  and extract structured fields in a separate downstream step.
+- This pipeline's job is to deliver clean raw text. The LLM does the structuring.
+- Priority: No longer a priority for this pipeline — tracked in enrichment layer.
 
 
 ---
