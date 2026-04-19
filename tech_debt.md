@@ -56,7 +56,7 @@ print() used throughout instead of Python logging
 Table data is stored as raw text instead of structured fields
 - File: `src/extractor.py`
 - Problem: table content is flattened into `content.text`, so row/column relationships are lost. Shared table values, such as one detecting condition applying to multiple DTC rows, are only implied by the page text.
-- Why it matters: this makes semantic search and LLM answering less reliable, because the model has to infer table structure instead of reading explicit field mappings.
+- - Why it matters: this makes semantic search and LLM answering less reliable, because the model has to infer table structure instead of reading explicit field mappings. It can also increase duplication and make output less efficient as more manuals are processed.
 - Fix: store one structured JSON record per DTC with explicit fields for diagnosis name, detecting condition, and possible causes. Keep raw page text as fallback context.
 - Priority: High — needed for accurate retrieval and structured downstream use.
 
