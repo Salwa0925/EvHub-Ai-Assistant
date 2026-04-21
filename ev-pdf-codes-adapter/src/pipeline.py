@@ -65,9 +65,9 @@ def main():
         # jump to except instead of crashing the whole program.
         # This way one bad PDF never kills the rest of the run.
         try:
-            records = extract_records(pdf_path, output_dir=out_dir)
+            result = extract_records(pdf_path, output_dir=out_dir)
 
-            if not records:
+            if not result or not result["pages"]:
                 print("  No records extracted - skipping.")
                 continue
 
@@ -79,30 +79,31 @@ def main():
             tmp_path = out_path.with_suffix(".json.tmp")   # e.g. data/EVB/EVB.json.tmp
 
             with open(tmp_path, 'w', encoding="utf-8") as f:
-                json.dump(records, f, indent=2, ensure_ascii=False)
+                json.dump(result, f, indent=2, ensure_ascii=False)
 
             tmp_path.rename(out_path)   # instant rename — cannot be interrupted halfway
 
-            print(f"  Saved {len(records)} records to {out_path}")
+            print(f"  Saved {len(result['pages'])} pages to {out_path}")
 
             # ── Quality report ────────────────────────────────────────────────
             # Check for pages where no text was extracted
-            missing_text = [r for r in records if not r["text"].strip()]
+            pages = result["pages"]   # pull out the pages list for easy access
 
-            # Collect all unique image filenames across all page records
+            missing_text = [r for r in pages if not r["text"].strip()]
+
             all_images = set()
-            for r in records:
-                all_images.update(r["images"])   # r["images"] is a list — update adds each item to the set
+            for r in pages:
+                all_images.update(r["images"])
             total_images = len(all_images)
 
             print(f"  Quality report:")
-            print(f"   Total pages    : {len(records)}")
+            print(f"   Total pages    : {len(pages)}")
             print(f"   Missing text   : {len(missing_text)}")
             print(f"   Images saved   : {total_images}")
 
             if missing_text:
-                for r in missing_text[:5]:   # show up to 5 pages with missing text
-                    print(f"   page {r['page']} ({r['dtc_mentions']}) has no text")
+                for r in missing_text[:5]:
+                    print(f"   page {r['pdf_page']} ({r['dtc_mentions']}) has no text")
 
         except Exception as e:
             # Something went wrong with this PDF — print the error and move on.
