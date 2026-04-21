@@ -47,13 +47,16 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
 
     print(f"\nExtracting content for {len(index)} codes across {len(page_to_codes)} pages...")
     records = []
+    seen_xrefs = set()   # shared across all pages — same image is never saved twice
+    seen_hashes = {}  # hash → filename — points duplicates to the already-saved file
 
     for page_num, codes in sorted(page_to_codes.items()):
         print(f"  Page {page_num} -> {codes}")
 
         page_ref_base = f"{pdf_path.stem}-{page_num}"
 
-        content = extract_content(pdf_path, page_num, codes, output_dir, page_ref_base)
+        content = extract_content(pdf_path, page_num, codes, output_dir, page_ref_base, seen_xrefs, seen_hashes)
+
 
         #One record per page - codes got into dtc_mentions list, not seperate records
         records.append({
