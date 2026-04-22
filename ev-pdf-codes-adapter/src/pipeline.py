@@ -9,9 +9,12 @@ Usage:
 
 import json
 import sys
+import hashlib
+from datetime import datetime
 from pathlib import Path
 
 from extractor import extract_records
+from pdf_profile import profile_pdf
 
 
 def main():
@@ -42,6 +45,10 @@ def main():
     base_dir = Path("data")
     base_dir.mkdir(exist_ok=True)  # create the data/ folder if it doesn't exist yet
 
+        # ── Processing report ─────────────────────────────────────────────────
+    # collects one entry per PDF — printed at the end and saved to data/
+    report = []
+
     # ── Process each PDF ───────────────────────────────────────────────────
     # we loop through every pdf file found in manuals/
     # each iteration, pdf_path points to the next file in the list
@@ -60,6 +67,36 @@ def main():
             print(f"  Already processed - skipping.")
             continue
 
+        # ── Profile the PDF ───────────────────────────────────────────────────
+        # quick check before any heavy extraction — tells us what type of PDF this is
+        metadata, pdf_profile = profile_pdf(pdf_path)
+        pdf_type = pdf_profile["pdf_type"]
+        print(f"  PDF type: {pdf_type}")
+
+        # ── Handle scanned PDFs ───────────────────────────────────────────────
+        # scanned PDFs have no text layer — OCR not yet built, so we skip extraction
+        # we still write a stub JSON so the file appears in the output with a clear reason
+        if pdf_type == "scanned":
+            document_id = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+            stub = {
+                "schema_version": 2,
+                "document_id":    document_id,
+                "source_file":    pdf_path.name,
+                "metadata":       metadata,
+                "pdf_profile":    pdf_profile,
+                "status":         "skipped",
+                "reason":         "scanned PDF — OCR not yet supported",
+                "pages":          []
+            }
+            tmp_path = out_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(stub, f, indent=2, ensure_ascii=False)
+            tmp_path.rename(out_path)
+            print(f"  Skipped — stub JSON written to {out_path}")
+            report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "skipped", "reason": "scanned PDF — OCR not yet supported"})
+            continue
+
+
         # ── Try to process — skip and log if anything goes wrong ─────────────
         # try/except means: attempt the code inside try — if ANY error occurs,
         # jump to except instead of crashing the whole program.
@@ -68,8 +105,24 @@ def main():
             result = extract_records(pdf_path, output_dir=out_dir)
 
             if not result or not result["pages"]:
-                print("  No records extracted - skipping.")
+                print("  No records extracted — writing stub JSON.")
+                stub = {
+                    "schema_version": 2,
+                    "document_id":    hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                    "source_file":    pdf_path.name,
+                    "metadata":       result.get("metadata", {}),
+                    "pdf_profile":    result.get("pdf_profile", {}),
+                    "status":         "skipped",
+                    "reason":         "no DTC codes found",
+                    "pages":          []
+                }
+                tmp_path = out_path.with_suffix(".json.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(stub, f, indent=2, ensure_ascii=False)
+                tmp_path.rename(out_path)
+                report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "skipped", "reason": "no DTC codes found"})
                 continue
+
 
             # ── Atomic JSON write ─────────────────────────────────────────────
             # We write to a temporary file first (.json.tmp).
@@ -84,6 +137,8 @@ def main():
             tmp_path.rename(out_path)   # instant rename — cannot be interrupted halfway
 
             print(f"  Saved {len(result['pages'])} pages to {out_path}")
+            report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "extracted", "pages": len(result["pages"])})
+
 
             # ── Quality report ────────────────────────────────────────────────
             # Check for pages where no text was extracted
@@ -109,6 +164,23 @@ def main():
             # Something went wrong with this PDF — print the error and move on.
             # The .json file was never written (atomic write), so next run will retry.
             print(f"  ERROR processing {pdf_path.name}: {e}")
+            report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "error", "reason": str(e)})
+
+
+    # ── Processing report ─────────────────────────────────────────────────
+    # print summary to terminal and save to data/processing_report.json
+    print(f"\n{'─' * 50}")
+    print(f"Processing report — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'─' * 50}")
+    for entry in report:
+        status = entry["status"].upper()
+        pages  = f"  {entry.get('pages', 0)} pages" if entry["status"] == "extracted" else f"  {entry.get('reason', '')}"
+        print(f"  {status:10} {entry['file']}{pages}")
+
+    report_path = base_dir / "processing_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump({"run_date": datetime.now().isoformat(), "results": report}, f, indent=2, ensure_ascii=False)
+    print(f"\nReport saved to {report_path}")
 
 
 if __name__ == "__main__":
