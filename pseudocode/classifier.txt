@@ -1,0 +1,121 @@
+FUNCTION run(raw_dir, output_dir):
+
+    Load all JSON files from raw/ folder
+    Filter out already classified files (resume support)
+
+    FOR each batch file:
+        Call classify_batch()
+
+
+FUNCTION classify_batch(raw_json, output_dir):
+
+    Load raw JSON file
+
+    ── Job 1: Filter Noise ──
+
+    FOR each text element:
+        
+        IF is_tab_letter(element):
+            → text is single capital letter
+            AND bbox[0] > 560 (far right margin)
+            → DISCARD
+
+        IF is_tiny_symbol(element):
+            → text is •, ·, ○, ●, etc.
+            → DISCARD
+
+    ── Job 2: Tag and Merge ──
+
+    Pass 1 — classify every remaining element:
+
+        FOR each element:
+
+            IF text starts with WARNING: / CAUTION: / DANGER:
+                → type = "warning_header"
+
+            ELSE IF label == section_header
+            OR text contains NOTE: / IMPORTANT: / PRECAUTION
+                → type = "section_header"
+
+            ELSE IF label == list_item
+            OR text matches numbered step pattern (1. / a) / -)
+                → type = "procedure_step"
+
+            ELSE IF text contains number + unit (V, A, Nm, mm, °C...)
+                → type = "spec_value"
+
+            ELSE
+                → type = "general_text"
+
+            THEN assign safety_level:
+                scan text for keywords:
+                    "high voltage", "electric shock", "400V"... → HIGH_VOLTAGE
+                    "caution", "burn", "pressure"...            → CAUTION
+                    "warning", "danger", "fire"...              → WARNING
+                    nothing found                               → NONE
+
+    Pass 2 — merge split warning pairs:
+
+        Walk classified elements with index i:
+
+            IF element[i].type == "warning_header"
+            AND element[i+1] exists:
+
+                Combine texts:
+                    "WARNING: " + element[i+1].text
+
+                Create merged element:
+                    type         = "warning"
+                    text         = combined text
+                    safety_level = re-check combined text for keywords
+
+                Append merged element
+                Skip element[i+1] (already absorbed)
+                i += 2
+
+            ELSE:
+                Append element as-is
+                i += 1
+
+    ── Job 3: Fix Broken Tables ──
+
+    FOR each table:
+
+        Detect table type:
+
+            IF first column has only short values (≤3 chars or empty):
+                → table_type = "index_table"  (TOC/section index)
+
+            ELSE IF >30% of left column cells are empty:
+                → table_type = "spec_table"   (nested spec, merged cells)
+
+            ELSE:
+                → table_type = "general"      (pass through unchanged)
+
+        IF index_table OR spec_table:
+
+            Forward-fill empty left columns:
+
+                FOR each column (except last):
+                    IF >40% of cells in this column are empty:
+                        
+                        last_value = ""
+                        FOR each row:
+                            IF cell is not empty:
+                                last_value = cell
+                            ELSE:
+                                cell = last_value  ← fill with last known
+
+            Store repaired grid in "data"
+            Store original grid in "data_raw" (for debugging)
+
+    ── Write Output ──
+
+    Write classified JSON:
+        schema_version = "1.1"
+        extraction     = unchanged from raw
+        text_elements  = filtered + tagged + merged
+        tables         = repaired with table_type added
+        images         = unchanged (passed through)
+
+    Log: filename  text=N  warnings=N  hv=N  tables=N  fixed=N

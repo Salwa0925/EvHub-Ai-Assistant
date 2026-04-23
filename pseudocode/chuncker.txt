@@ -1,0 +1,71 @@
+FUNCTION run():
+    Load all classified JSON files from classified/ folder
+    Sort them by start page number (1_5 before 6_10 etc.)
+    
+    Merge all files into three flat ordered lists:
+        all_text_elements  (in page order across all files)
+        all_tables         (grouped by page_pdf for fast lookup)
+        all_images         (grouped by page_pdf for fast lookup)
+    
+    Call build_chunks() with these three lists
+    Write result to chunks.json
+
+
+FUNCTION build_chunks(texts, tables, images):
+    
+    Initialize:
+        chunks = []
+        current_chunk_elements = []
+        current_chunk_pages = set()
+        heading = "PREAMBLE"
+        section_code = None
+        page_pdf = None
+        page_manual = None
+        chunk_index = 0
+
+    FOR each element in texts:
+
+        IF element.type == "section_header":
+            
+            → FLUSH current chunk to chunks list (see FLUSH below)
+            
+            → Start new chunk:
+                heading      = element.text
+                section_code = element.section_code
+                page_pdf     = element.page_pdf
+                page_manual  = element.page_manual
+
+        ADD element to current_chunk_elements
+        ADD element.page_pdf to current_chunk_pages
+
+    → FLUSH final chunk (handles last chunk with no following header)
+
+    RETURN chunks
+
+
+FUNCTION flush(current_elements, current_pages, tables, images):
+    
+    IF current_elements is empty → do nothing, return
+
+    Collect all tables whose page_pdf is in current_pages
+    Collect all images whose page_pdf is in current_pages
+
+    safety_level  = highest safety level found in any element
+    prerequisites = sentences containing before/ensure/verify
+                    from the first 5 elements only
+
+    Build chunk object:
+        chunk_id      = section_code + page_pdf + chunk_index
+        page_pdf      = first page of this chunk
+        page_manual   = manual page ref (e.g. EVC-11)
+        section_code  = system code (e.g. EVC, GI, HA)
+        heading       = section header text
+        safety_level  = highest found
+        prerequisites = list of prerequisite sentences
+        text_blocks   = all elements
+        tables        = all tables on chunk pages
+        images        = all images on chunk pages
+
+    Append chunk to chunks list
+    Clear current_elements and current_pages
+    Increment chunk_index

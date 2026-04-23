@@ -1,0 +1,90 @@
+FUNCTION run(pdf_path, output_dir, config):
+
+    Read total page count from PDF using pypdf
+    
+    Build three Docling converters ONCE (reused across all batches):
+        conv_fast       → OCR OFF, TableFormer OFF
+        conv_tables     → OCR OFF, TableFormer ON
+        conv_ocr_tables → OCR ON,  TableFormer ON
+
+    Build list of batches:
+        [(1,5), (6,10), (11,15), ... (121,121)]
+
+    Filter out batches already on disk (resume support)
+
+    FOR each batch (start_page, end_page):
+        Call process_batch()
+
+
+FUNCTION process_batch(pdf, start, end, output_dir, converters, config):
+
+    ── Step 1: pymupdf pass (runs first, independent of Docling) ──
+
+    FOR each page in start..end:
+
+        Open page with pymupdf
+
+        READ footer:
+            Clip to bottom 8% of page
+            Search for pattern [A-Z]{1,5}-\d{1,4}
+            → returns (manual_page, section_code, footer_text) e.g. ("EVC-11", "EVC")
+            → returns (None, None) if not found
+        
+        EXTRACT raster images (Step 1):
+            Call get_images() → list of embedded bitmaps
+            FOR each image:
+                IF too small (< min_img_size px) → skip
+                Extract raw bytes via extract_image(xref)
+                Save as page_N_raster_N.ext
+                Record (file, page_pdf, page_manual, bbox, type=raster)
+
+        EXTRACT vector regions (Step 2):
+            Call get_text("dict") → list of blocks
+            FOR each block of type=image:
+                IF too small → skip
+                IF already captured as raster → skip
+                Render region to PNG via get_pixmap(clip=bbox)
+                Save as page_N_vector_N.png
+                Record (file, page_pdf, page_manual, bbox, type=vector)
+
+        Store page_map[page_no] = (manual_page, section_code, footer_text)
+
+    ── Step 2: Docling Pass 1 (fast) ──
+
+    Convert batch with conv_fast
+    Walk iterate_items() ONCE collecting:
+        TextItems  → (text, page_pdf, page_manual, label, bbox)
+        TableItems → (grid, markdown, page_pdf, page_manual, bbox)
+
+    CHECK results:
+        scanned    = total characters < 50 threshold
+        has_tables = any table has 4+ columns
+
+    ── Step 3: Docling Pass 2 (conditional) ──
+
+    IF scanned:
+        Re-convert with conv_ocr_tables
+        Re-collect text and tables
+        ran_ocr = True, ran_tableformer = True
+
+    ELSE IF has_tables:
+        Re-convert with conv_tables
+        Re-collect text and tables
+        ran_tableformer = True
+
+    ELSE:
+        Keep Pass 1 result
+        (no Pass 2 needed)
+
+    ── Step 4: Write batch JSON ──
+
+    Stamp page_manual and section_code onto every text element and table
+    using page_map built in Step 1
+
+    Write start_end.json:
+        extraction metadata (source, vehicle, pages, ocr_used, tableformer_used, page_map)
+        text_elements
+        tables
+        images
+
+    Free memory: del result, gc.collect()
