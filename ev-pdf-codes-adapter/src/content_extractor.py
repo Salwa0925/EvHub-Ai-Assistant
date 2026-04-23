@@ -29,6 +29,7 @@ def clean_text(raw: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+
 def page_belongs_to_codes(page: fitz.Page, codes: list) -> bool:
     """
     Check if a page header contains any of the given codes.
@@ -36,6 +37,75 @@ def page_belongs_to_codes(page: fitz.Page, codes: list) -> bool:
     """
     top_text = page.get_text("text")[:300].upper()
     return any(code.upper() in top_text for code in codes)
+
+
+def _find_heading_y(page: fitz.Page, heading: str) -> float | None:
+    """
+    Find the bottom y-coordinate of a heading line on a page.
+    Searches every line in every block (case-insensitive exact match).
+    Returns None if not found.
+    """
+    heading_lower = heading.lower()
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:   # text blocks only
+            continue
+        for line in block.get("lines", []):
+            line_text = " ".join(
+                span["text"] for span in line.get("spans", [])
+            ).strip().lower()
+            if line_text == heading_lower:
+                return line["bbox"][3]  # y1 — bottom edge of this line
+    return None
+
+
+def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
+    """
+    Extract tables whose bounding box overlaps rect by at least 50%.
+    Uses overlap ratio to assign tables to the correct zone when they
+    straddle a boundary.
+
+    Returns list of tables.
+    Each table  = list of rows.
+    Each row    = list of strings (None → "", whitespace stripped).
+    Tables with fewer than 2 rows or 2 columns are skipped (likely noise).
+    """
+    if rect is None or rect.is_empty:
+        return []
+
+    finder = page.find_tables()
+    result = []
+
+    for table in finder.tables:
+        tbbox      = fitz.Rect(table.bbox)
+        overlap    = rect & tbbox          # intersection rect
+        if overlap.is_empty:
+            continue
+
+        table_area = tbbox.width * tbbox.height
+        if table_area == 0:
+            continue
+
+        overlap_ratio = (overlap.width * overlap.height) / table_area
+        if overlap_ratio < 0.5:
+            continue
+
+        rows = table.extract()
+
+        # Skip noise: must have at least 2 rows and 2 columns
+        if not rows or len(rows) < 2:
+            continue
+        if not rows[0] or len(rows[0]) < 2:
+            continue
+
+        # Normalise cells: None → "", strip whitespace
+        clean_rows = [
+            [str(cell).strip() if cell is not None else "" for cell in row]
+            for row in rows
+        ]
+        result.append(clean_rows)
+
+    return result
+
 
 def extract_content(
     pdf_path: Path,
@@ -46,80 +116,123 @@ def extract_content(
     seen_xrefs: set,       # shared across all sections — prevents saving same xref twice
     seen_hashes: dict,     # hash → filename — points duplicates to the already-saved file
 ) -> dict:
-    
     """
     Extract content starting from start_page, continuing while
     the page header still belongs to our codes.
-    Also saves any images found to output_dir and returns their filenames.
-    Returns: {"text": "...", "has_images": True/False, "images": ["EVB-167-img1.png", ...]}
+    Saves images to output_dir and extracts tables per zone.
+
+    Returns:
+        text                     — full merged text across all pages
+        has_images               — True if any images were saved
+        images                   — list of saved image filenames
+        start_page_ref_footer    — footer label on first page (cross-check)
+        end_page_ref             — footer label on last page
+        end_pdf_page             — physical PDF page of last page (1-indexed)
+        dtc_logic_tables         — tables found in the DTC Logic zone
+        diagnosis_procedure_tables — tables found in the Diagnosis Procedure zone
     """
     with fitz.open(str(pdf_path)) as pdf:
         total_pages = len(pdf)
 
-        full_text = ""
-        has_images = False
-        image_filenames = []   # will hold the names of saved image files
-        img_counter = 1        # counts up across ALL pages in this DTC section: img1, img2, img3...
-        start_page_ref_footer = None  # footer label on the first page — used to cross-check the index
-        end_page_ref          = None  # footer label on the last page
+        full_text             = ""
+        has_images            = False
+        image_filenames       = []
+        img_counter           = 1
+        start_page_ref_footer = None
+        end_page_ref          = None
+
+        # ── Table extraction state ────────────────────────────────────────────
+        in_dtc_logic            = False   # currently inside DTC Logic zone
+        in_diagnosis            = False   # currently inside Diagnosis Procedure zone
+        dtc_logic_tables        = []
+        diagnosis_procedure_tables = []
+
         for page_num in range(start_page, total_pages + 1):
             page = pdf[page_num - 1]
 
             if page_num > start_page and not page_belongs_to_codes(page, codes):
                 break
 
-            # ── Read printed page label from footer ───────────────────────────────
+            # ── Footer page label ─────────────────────────────────────────────
             ref = read_page_ref(page)
             if page_num == start_page:
-                start_page_ref_footer = ref   # capture once — will be compared against index ref
-            end_page_ref = ref                # updated each iteration — last value = end label
+                start_page_ref_footer = ref
+            end_page_ref = ref
 
-            # ── Extract text ──────────────────────────────────────────────────────
-            raw_text = page.get_text("text")
+            # ── Text ──────────────────────────────────────────────────────────
+            raw_text   = page.get_text("text")
             full_text += clean_text(raw_text) + "\n\n"
 
-            # ── Extract images ────────────────────────────────────────────────────
-            # get_images() returns a list of image references on this page.
-            # Each item is a tuple; the first element [0] is the xref — the image's unique ID in the PDF.
-            page_images = page.get_images(full=True)
-
-            for img_info in page_images:
-                xref = img_info[0]  # unique ID of this image inside the PDF
-
-                # Skip if we already saved this xref anywhere in this document
+            # ── Images ────────────────────────────────────────────────────────
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
                 if xref in seen_xrefs:
                     continue
                 seen_xrefs.add(xref)
 
-                # Skip small decorative images (icons, warning signs, logos)
-                # Real diagnostic diagrams are always larger than 100x100 pixels
                 img_data = pdf.extract_image(xref)
                 if img_data["width"] < 100 or img_data["height"] < 100:
                     continue
 
-                img_bytes = img_data["image"]           # raw image bytes
-                img_ext = img_data["ext"]               # "png", "jpeg", etc.
-                img_hash = hashlib.md5(img_bytes).hexdigest()  # fingerprint of the image content
-
+                img_bytes    = img_data["image"]
+                img_ext      = img_data["ext"]
+                img_hash     = hashlib.md5(img_bytes).hexdigest()
                 img_filename = f"{page_ref_base}-img{img_counter}.{img_ext}"
-                img_path = output_dir / img_filename
+                img_path     = output_dir / img_filename
 
                 if img_hash not in seen_hashes:
-                    # New image — save to disk and remember its filename
                     with open(img_path, "wb") as f:
                         f.write(img_bytes)
-                    seen_hashes[img_hash] = img_filename  # store hash → filename
+                    seen_hashes[img_hash] = img_filename
 
-                # Always reference the original saved file (even if this is a duplicate)
                 image_filenames.append(seen_hashes[img_hash])
                 img_counter += 1
                 has_images = True
 
+            # ── Tables per zone ───────────────────────────────────────────────
+            pw = page.rect.width
+            ph = page.rect.height
+
+            dtc_logic_y = _find_heading_y(page, "dtc logic")
+            diagnosis_y = _find_heading_y(page, "diagnosis procedure")
+
+            # Zone 1 — DTC Logic
+            if dtc_logic_y is not None:
+                # Heading found on this page — enter dtc_logic zone
+                in_dtc_logic = True
+                in_diagnosis = False
+                bottom = diagnosis_y if diagnosis_y is not None else ph
+                dtc_logic_tables.extend(
+                    extract_tables_from_rect(page, fitz.Rect(0, dtc_logic_y, pw, bottom))
+                )
+            elif in_dtc_logic:
+                # Continuation page in dtc_logic zone
+                bottom = diagnosis_y if diagnosis_y is not None else ph
+                dtc_logic_tables.extend(
+                    extract_tables_from_rect(page, fitz.Rect(0, 0, pw, bottom))
+                )
+
+            # Zone 2 — Diagnosis Procedure
+            if diagnosis_y is not None:
+                # Heading found on this page — enter diagnosis zone
+                in_diagnosis = True
+                in_dtc_logic = False
+                diagnosis_procedure_tables.extend(
+                    extract_tables_from_rect(page, fitz.Rect(0, diagnosis_y, pw, ph))
+                )
+            elif in_diagnosis:
+                # Continuation page in diagnosis zone
+                diagnosis_procedure_tables.extend(
+                    extract_tables_from_rect(page, fitz.Rect(0, 0, pw, ph))
+                )
+
     return {
-        "text":                  full_text.strip(),
-        "has_images":            has_images,
-        "images":                image_filenames,
-        "start_page_ref_footer": start_page_ref_footer,  # footer label on first page — for cross-check
-        "end_page_ref":          end_page_ref,            # footer label on last page
-        "end_pdf_page":          page_num - 1,            # physical PDF page (1-indexed)
+        "text":                        full_text.strip(),
+        "has_images":                  has_images,
+        "images":                      image_filenames,
+        "start_page_ref_footer":       start_page_ref_footer,
+        "end_page_ref":                end_page_ref,
+        "end_pdf_page":                page_num - 1,
+        "dtc_logic_tables":            dtc_logic_tables,
+        "diagnosis_procedure_tables":  diagnosis_procedure_tables,
     }

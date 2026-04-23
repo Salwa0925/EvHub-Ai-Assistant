@@ -97,8 +97,11 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
             "has_images":     content["has_images"],   # True if any images were saved
             "images":         content["images"],       # list of saved image filenames
             # ── two high-level text blocks from text parser ──────────────────
-            "dtc_logic_block":           parsed["dtc_logic_block"],
-            "diagnosis_procedure_block": parsed["diagnosis_procedure_block"],
+            "dtc_logic_block":             parsed["dtc_logic_block"],
+            "diagnosis_procedure_block":   parsed["diagnosis_procedure_block"],
+            # ── tables extracted per zone (raw cell strings) ─────────────────
+            "dtc_logic_tables":            content["dtc_logic_tables"],
+            "diagnosis_procedure_tables":  content["diagnosis_procedure_tables"],
         })
 
 

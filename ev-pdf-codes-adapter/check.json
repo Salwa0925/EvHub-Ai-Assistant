@@ -1,0 +1,20 @@
+{
+  "dtc_y": 115.51583099365234,
+  "diag_y": null,
+  "tables": [
+    [
+      [
+        "DTC",
+        "Trouble diagnosis name",
+        "DTC detecting condition",
+        "Possible causes"
+      ],
+      [
+        "P0A0D",
+        "HV SYSTEM INTERLOCK\nERROR",
+        "Self diagnosis program of Li-ion battery controller de-\ntects a malfunction in the CPU.",
+        "Li-ion battery controller"
+      ]
+    ]
+  ]
+}
