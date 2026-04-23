@@ -144,21 +144,16 @@ def main():
             # Check for pages where no text was extracted
             pages = result["pages"]   # pull out the pages list for easy access
 
-            missing_text = [r for r in pages if not r["text"].strip()]
+            missing_text = [r for r in pages if not any([
+                r.get("dtc_logic_block"),
+                r.get("diagnosis_procedure_block"),
+            ])]
+
 
             all_images = set()
             for r in pages:
                 all_images.update(r["images"])
             total_images = len(all_images)
-
-            print(f"  Quality report:")
-            print(f"   Total pages    : {len(pages)}")
-            print(f"   Missing text   : {len(missing_text)}")
-            print(f"   Images saved   : {total_images}")
-
-            if missing_text:
-                for r in missing_text[:5]:
-                    print(f"   page {r['pdf_page']} ({r['dtc_mentions']}) has no text")
 
         except Exception as e:
             # Something went wrong with this PDF — print the error and move on.

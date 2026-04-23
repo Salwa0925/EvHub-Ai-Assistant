@@ -4,6 +4,23 @@ import fitz
 from pathlib import Path
 from patterns import INFOID_RE, SIDEBAR_RE
 
+# Matches printed page labels like EVB-88, EVC-109, TM-44, TMS-12
+# Pattern: 2–4 uppercase letters, dash, one or more digits
+_PAGE_REF_RE = re.compile(r'\b([A-Z]{2,4}-\d+)\b')
+
+
+def read_page_ref(page: fitz.Page) -> str | None:
+    """
+    Extract the printed page label from the page footer (e.g. 'EVB-88').
+    Clips the bottom 10% of the page where the footer label lives.
+    Returns None if no label is found.
+    """
+    rect = page.rect
+    footer_rect = fitz.Rect(0, rect.height * 0.88, rect.width, rect.height)
+    footer_text = page.get_text("text", clip=footer_rect)
+    match = _PAGE_REF_RE.search(footer_text)
+    return match.group(1) if match else None
+
 
 def clean_text(raw: str) -> str:
     """Remove sidebar letters and internal reference IDs."""
@@ -43,11 +60,19 @@ def extract_content(
         has_images = False
         image_filenames = []   # will hold the names of saved image files
         img_counter = 1        # counts up across ALL pages in this DTC section: img1, img2, img3...
+        start_page_ref_footer = None  # footer label on the first page — used to cross-check the index
+        end_page_ref          = None  # footer label on the last page
         for page_num in range(start_page, total_pages + 1):
             page = pdf[page_num - 1]
 
             if page_num > start_page and not page_belongs_to_codes(page, codes):
                 break
+
+            # ── Read printed page label from footer ───────────────────────────────
+            ref = read_page_ref(page)
+            if page_num == start_page:
+                start_page_ref_footer = ref   # capture once — will be compared against index ref
+            end_page_ref = ref                # updated each iteration — last value = end label
 
             # ── Extract text ──────────────────────────────────────────────────────
             raw_text = page.get_text("text")
@@ -91,7 +116,10 @@ def extract_content(
                 has_images = True
 
     return {
-        "text": full_text.strip(),
-        "has_images": has_images,
-        "images": image_filenames,   # ← NEW: list of saved image filenames
+        "text":                  full_text.strip(),
+        "has_images":            has_images,
+        "images":                image_filenames,
+        "start_page_ref_footer": start_page_ref_footer,  # footer label on first page — for cross-check
+        "end_page_ref":          end_page_ref,            # footer label on last page
+        "end_pdf_page":          page_num - 1,            # physical PDF page (1-indexed)
     }

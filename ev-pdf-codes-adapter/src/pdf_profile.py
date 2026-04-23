@@ -17,8 +17,11 @@ def profile_pdf(pdf_path: Path) -> dict:
         "title":             meta.get("title", ""),
         "author":            meta.get("author", ""),
         "producer":          meta.get("producer", ""),
+        "creator":           meta.get("creator", ""),       # software that created the PDF
+        "format":            meta.get("format", ""),        # PDF version e.g. "PDF 1.4"
         "creation_date":     meta.get("creationDate", ""),
-        "modification_date": meta.get("modDate", "")
+        "modification_date": meta.get("modDate", ""),
+        "encryption":        meta.get("encryption", None)   # None = no protection, value = protected
     }
 
     # ── DIGITAL DETECTION ─────────────────────────────────────────────────
@@ -36,6 +39,11 @@ def profile_pdf(pdf_path: Path) -> dict:
     # a hybrid PDF (mostly digital, few scanned pages) still counts as digital here
     # per-page OCR fallback handles the scanned pages during extraction
     is_digital = pages_with_text > 0
+
+    #classify pdf type - used by pipeline to decide whether to rpocess or skip
+    #"digital" - has txt layer, full eextraction supported
+    #"merged" - detected as multiple manuals combined - handled seperately (issue #20)
+    pdf_type = "digital" if is_digital else "scanned"
 
     # ── LINK DETECTION ────────────────────────────────────────────────────
     # Sample first 5 pages for links
@@ -56,8 +64,10 @@ def profile_pdf(pdf_path: Path) -> dict:
         "needs_ocr":           not is_digital,
         "has_links":           link_count > 0,
         "has_internal_links":  has_internal_links,
-        "link_count_sample":   link_count
+        "link_count_sample":   link_count,
+        "pdf_type":            pdf_type    # "digital" or "scanned" — drives pipeline decision
     }
+
 
     pdf.close()
     return metadata, pdf_profile

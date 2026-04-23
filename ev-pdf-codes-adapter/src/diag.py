@@ -1,50 +1,48 @@
-import fitz
+import json
+from pathlib import Path
+from collections import Counter
 
-path = "manuals/2011 Nissan Leaf Workshop Manual.pdf"
-doc = fitz.open(path)
+# ── Load the JSON file ────────────────────────────────────────────────────────
+# Point this at whichever JSON output you want to analyse
+json_path = Path("data/2011 Nissan Leaf Workshop Manual for EVB/2011 Nissan Leaf Workshop Manual for EVB.json")
 
-print(f"Total pages: {len(doc)}")
-print("Scanning all pages for DTC Index sections...")
+with open(json_path, encoding="utf-8") as f:
+    doc = json.load(f)
+
+pages = doc["pages"]
+print(f"Total pages: {len(pages)}")
 print()
 
-for i in range(len(doc)):
-    page = doc[i]
+# ── Count how many pages each line appears on ─────────────────────────────────
+# We use a Counter — it counts occurrences of each unique value
+line_counts = Counter()
 
-    # quick filter — must have "DTC Index" text on this page
-    if "dtc index" not in page.get_text("text").lower():
-        continue
+for record in pages:
+    # Combine both text blocks for noise analysis
+    text = " ".join(filter(None, [
+        record.get("dtc_logic_block", ""),
+        record.get("diagnosis_procedure_block", ""),
+    ]))
 
-    # get all text blocks on the page
-    blocks = page.get_text("blocks")  # each block: (x0, y0, x1, y1, text, ...)
-    dtc_index_y = None
+    # Split text into individual lines, strip whitespace, skip empty lines
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    for block in blocks:
-        block_text = block[4].strip()
-        # first line must be exactly "DTC Index" AND block must have INFOID
-        if block_text.split("\n")[0].strip().lower() == "dtc index" and "infoid:" in block_text.lower():
-            dtc_index_y = block[3]  # y1 = bottom edge of the heading block
-            break
+    # Use a set — we only want to count each line ONCE per page
+    # (not 5 times if it appears 5 times on the same page)
+    unique_lines = set(lines)
 
-    # no standalone "DTC Index" heading found on this page — skip
-    if dtc_index_y is None:
-        continue
+    for line in unique_lines:
+        line_counts[line] += 1   # this line appeared on one more page
 
-    # find tables below the heading
-    tables = page.find_tables()
-    for table in tables.tables:
-        rows = table.extract()
-        if not rows:
-            continue
+# ── Print lines that appear on more than 50% of pages ────────────────────────
+threshold = len(pages) * 0.5   # 50% of total pages
 
-        # only accept tables that start below the "DTC Index" heading
-        if table.bbox[1] < dtc_index_y:
-            continue
+print(f"Lines appearing on more than 50% of pages ({threshold:.0f}+ pages):")
+print()
 
-        if len(rows) - 1 > 2:
-            header = " | ".join(str(c).strip() if c else "" for c in rows[0])
-            print(f"Page {i + 1}: {header}  ({len(rows) - 1} data rows)")
+for line, count in line_counts.most_common():
+    if count < threshold:
+        break   # most_common() is sorted — once we go below threshold, stop
 
-            # check for internal hyperlinks on this page (kind == 4)
-            links = page.get_links()
-            internal_links = [l for l in links if l["kind"] == 4]
-            print(f"  Internal links: {len(internal_links)}")
+    pct = (count / len(pages)) * 100
+    print(f"  {count:4d} pages ({pct:.0f}%)  |  {line}")
