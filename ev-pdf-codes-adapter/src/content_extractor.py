@@ -59,14 +59,61 @@ def _find_heading_y(page: fitz.Page, heading: str) -> float | None:
     return None
 
 
+def _get_line_extent(page: fitz.Page, table_bbox: tuple) -> tuple[float, float]:
+    """
+    Scan drawing paths for horizontal lines that overlap the table's y-range.
+    Returns (left_x, right_x) — the widest span found.
+    Falls back to the table bbox edges if no wider lines are found.
+
+    A horizontal line is a filled rect that is very short in height (<=3 pt)
+    and meaningfully wide (>=20 pt).
+    """
+    ty0, ty1 = table_bbox[1], table_bbox[3]
+    left_x  = table_bbox[0]
+    right_x = table_bbox[2]
+
+    for path in page.get_drawings():
+        r = path.get("rect")
+        if r is None:
+            continue
+        height = r.y1 - r.y0
+        width  = r.x1 - r.x0
+        if height > 3 or width < 20:   # not a horizontal rule
+            continue
+        if r.y0 < ty1 and r.y1 > ty0:  # overlaps table y-range
+            left_x  = min(left_x,  r.x0)
+            right_x = max(right_x, r.x1)
+
+    return left_x, right_x
+
+
+def _row_y_ranges(table) -> list[tuple[float, float]]:
+    """
+    Derive per-row y-ranges from the table's cell bounding boxes.
+    Works for any table regardless of row count or row height.
+    """
+    y_vals = set()
+    for cell in table.cells:
+        y_vals.add(cell[1])   # y0
+        y_vals.add(cell[3])   # y1
+    y_sorted = sorted(y_vals)
+    return [(y_sorted[i], y_sorted[i + 1]) for i in range(len(y_sorted) - 1)]
+
+
 def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
     """
     Extract tables whose bounding box overlaps rect by at least 50%.
 
     Returns list of tables.
     Each table  = list of rows.
-    Each row    = list of strings (None → "", whitespace stripped).
+    Each row    = list of strings (None -> "", whitespace stripped).
     Tables with fewer than 2 rows or 2 columns are skipped (likely noise).
+
+    Handles tables whose outermost columns have no vertical border line:
+    fitz misses those columns because it uses drawn vertical lines as column
+    boundaries. We recover them by checking whether the page's horizontal
+    rules extend beyond the detected table bbox and, if so, extracting text
+    from those outer zones per row.
     """
     if rect is None or rect.is_empty:
         return []
@@ -96,11 +143,29 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
         if not rows[0] or len(rows[0]) < 2:
             continue
 
-        # Normalise cells: None → "", strip whitespace
+        # Normalise cells: None -> "", strip whitespace
         clean_rows = [
             [str(cell).strip() if cell is not None else "" for cell in row]
             for row in rows
         ]
+
+        # Recover columns hidden outside the detected table bbox.
+        # Threshold: only act if the extension is more than 5 pt.
+        line_left, line_right = _get_line_extent(page, table.bbox)
+        row_ranges = _row_y_ranges(table)
+
+        if table.bbox[0] - line_left > 5:
+            for r_idx, (ry0, ry1) in enumerate(row_ranges):
+                clip = fitz.Rect(line_left, ry0, table.bbox[0], ry1)
+                text = page.get_text("text", clip=clip).strip()
+                clean_rows[r_idx].insert(0, text)
+
+        if line_right - table.bbox[2] > 5:
+            for r_idx, (ry0, ry1) in enumerate(row_ranges):
+                clip = fitz.Rect(table.bbox[2], ry0, line_right, ry1)
+                text = page.get_text("text", clip=clip).strip()
+                clean_rows[r_idx].append(text)
+
         result.append(clean_rows)
 
     return result
