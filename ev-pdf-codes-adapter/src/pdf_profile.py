@@ -14,14 +14,16 @@ def profile_pdf(pdf_path: Path) -> dict:
     # doc.metadata is a dict PyMuPDF reads from the PDF header
     meta = pdf.metadata
     metadata = {
-        "title":             meta.get("title", ""),
-        "author":            meta.get("author", ""),
-        "producer":          meta.get("producer", ""),
-        "creator":           meta.get("creator", ""),       # software that created the PDF
-        "format":            meta.get("format", ""),        # PDF version e.g. "PDF 1.4"
-        "creation_date":     meta.get("creationDate", ""),
-        "modification_date": meta.get("modDate", ""),
-        "encryption":        meta.get("encryption", None)   # None = no protection, value = protected
+        "title":             meta.get("title")        or None,  # document title
+        "author":            meta.get("author")       or None,  # document author
+        "subject":           meta.get("subject")      or None,  # subject field (often empty)
+        "keywords":          meta.get("keywords")     or None,  # keyword tags (often empty)
+        "creator":           meta.get("creator")      or None,  # software that created the PDF
+        "producer":          meta.get("producer")     or None,  # software that produced the PDF
+        "format":            meta.get("format")       or None,  # PDF version e.g. "PDF 1.4"
+        "creation_date":     meta.get("creationDate") or None,
+        "modification_date": meta.get("modDate")      or None,
+        "encryption":        meta.get("encryption")   or None,  # None = no protection
     }
 
     # ── DIGITAL DETECTION ─────────────────────────────────────────────────

@@ -79,14 +79,14 @@ def main():
         if pdf_type == "scanned":
             document_id = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
             stub = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "document_id":    document_id,
                 "source_file":    pdf_path.name,
                 "metadata":       metadata,
                 "pdf_profile":    pdf_profile,
                 "status":         "skipped",
                 "reason":         "scanned PDF — OCR not yet supported",
-                "pages":          []
+                "records":        []
             }
             tmp_path = out_path.with_suffix(".json.tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -104,17 +104,17 @@ def main():
         try:
             result = extract_records(pdf_path, output_dir=out_dir)
 
-            if not result or not result["pages"]:
+            if not result or not result["records"]:
                 print("  No records extracted — writing stub JSON.")
                 stub = {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "document_id":    hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
                     "source_file":    pdf_path.name,
                     "metadata":       result.get("metadata", {}),
                     "pdf_profile":    result.get("pdf_profile", {}),
                     "status":         "skipped",
                     "reason":         "no DTC codes found",
-                    "pages":          []
+                    "records":        []
                 }
                 tmp_path = out_path.with_suffix(".json.tmp")
                 with open(tmp_path, "w", encoding="utf-8") as f:
@@ -136,23 +136,21 @@ def main():
 
             tmp_path.rename(out_path)   # instant rename — cannot be interrupted halfway
 
-            print(f"  Saved {len(result['pages'])} pages to {out_path}")
-            report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "extracted", "pages": len(result["pages"])})
+            print(f"  Saved {len(result['records'])} records to {out_path}")
+            report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "extracted", "records": len(result["records"])})
 
 
             # ── Quality report ────────────────────────────────────────────────
-            # Check for pages where no text was extracted
-            pages = result["pages"]   # pull out the pages list for easy access
+            records_list = result["records"]
 
-            missing_text = [r for r in pages if not any([
-                r.get("dtc_logic_block"),
-                r.get("diagnosis_procedure_block"),
-            ])]
+            # Records with no sections extracted (no text found)
+            missing_text = [r for r in records_list if not r.get("sections")]
 
-
+            # Count unique images across all records
             all_images = set()
-            for r in pages:
-                all_images.update(r["images"])
+            for r in records_list:
+                for img in r.get("images", []):
+                    all_images.add(img["image_path"])
             total_images = len(all_images)
 
         except Exception as e:
@@ -164,12 +162,12 @@ def main():
 
     # ── Processing report ─────────────────────────────────────────────────
     # print summary to terminal and save to data/processing_report.json
-    print(f"\n{'─' * 50}")
-    print(f"Processing report — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"{'─' * 50}")
+    print(f"\n{'-' * 50}")
+    print(f"Processing report -- {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'-' * 50}")
     for entry in report:
         status = entry["status"].upper()
-        pages  = f"  {entry.get('pages', 0)} pages" if entry["status"] == "extracted" else f"  {entry.get('reason', '')}"
+        pages  = f"  {entry.get('records', 0)} records" if entry["status"] == "extracted" else f"  {entry.get('reason', '')}"
         print(f"  {status:10} {entry['file']}{pages}")
 
     report_path = base_dir / "processing_report.json"

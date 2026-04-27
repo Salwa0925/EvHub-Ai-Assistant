@@ -3,6 +3,7 @@ import hashlib
 import fitz
 from pathlib import Path
 from patterns import INFOID_RE, SIDEBAR_RE
+from text_parser import KNOWN_HEADINGS
 
 # Matches printed page labels like EVB-88, EVC-109, TM-44, TMS-12
 # Pattern: 2–4 uppercase letters, dash, one or more digits
@@ -61,8 +62,6 @@ def _find_heading_y(page: fitz.Page, heading: str) -> float | None:
 def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
     """
     Extract tables whose bounding box overlaps rect by at least 50%.
-    Uses overlap ratio to assign tables to the correct zone when they
-    straddle a boundary.
 
     Returns list of tables.
     Each table  = list of rows.
@@ -77,7 +76,7 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
 
     for table in finder.tables:
         tbbox      = fitz.Rect(table.bbox)
-        overlap    = rect & tbbox          # intersection rect
+        overlap    = rect & tbbox
         if overlap.is_empty:
             continue
 
@@ -107,6 +106,28 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
     return result
 
 
+def _clean_zone_text(page: fitz.Page, rect: fitz.Rect) -> str:
+    """Extract and clean text from a specific zone rect on a page."""
+    raw = page.get_text("text", clip=rect)
+    return clean_text(raw)
+
+
+def _finalize_section(section: dict) -> dict:
+    """
+    Convert the internal section builder into the final section dict.
+    Joins text collected across multiple pages into one string.
+    """
+    return {
+        "heading":    section["heading"],
+        "role":       section["role"],
+        # join text collected from multiple pages — None if nothing was collected
+        "text":       "\n\n".join(section["text_parts"]).strip() or None,
+        "tables":     section["tables"],   # list of {page, page_ref, rows}
+        "page_start": section["page_start"],
+        "page_end":   section["page_end"],
+    }
+
+
 def extract_content(
     pdf_path: Path,
     start_page: int,
@@ -119,33 +140,32 @@ def extract_content(
     """
     Extract content starting from start_page, continuing while
     the page header still belongs to our codes.
-    Saves images to output_dir and extracts tables per zone.
 
     Returns:
-        text                     — full merged text across all pages
+        raw_text                 — full unprocessed text across all pages
+        sections                 — list of section dicts with text, tables, page range
         has_images               — True if any images were saved
-        images                   — list of saved image filenames
+        image_list               — list of image metadata dicts (filename, pdf_page, page_ref)
         start_page_ref_footer    — footer label on first page (cross-check)
         end_page_ref             — footer label on last page
         end_pdf_page             — physical PDF page of last page (1-indexed)
-        dtc_logic_tables         — tables found in the DTC Logic zone
-        diagnosis_procedure_tables — tables found in the Diagnosis Procedure zone
     """
     with fitz.open(str(pdf_path)) as pdf:
         total_pages = len(pdf)
 
-        full_text             = ""
+        raw_text_parts        = []   # one raw string per page — joined at end
         has_images            = False
-        image_filenames       = []
+        image_list            = []   # image metadata, IDs assigned later in extractor.py
         img_counter           = 1
         start_page_ref_footer = None
         end_page_ref          = None
+        last_processed        = start_page
 
-        # ── Table extraction state ────────────────────────────────────────────
-        in_dtc_logic            = False   # currently inside DTC Logic zone
-        in_diagnosis            = False   # currently inside Diagnosis Procedure zone
-        dtc_logic_tables        = []
-        diagnosis_procedure_tables = []
+        # ── Section tracking ──────────────────────────────────────────────────
+        # active_section holds the section currently being built.
+        # When a new heading is found, we close active_section and open a new one.
+        active_section = None
+        all_sections   = []
 
         for page_num in range(start_page, total_pages + 1):
             page = pdf[page_num - 1]
@@ -153,15 +173,19 @@ def extract_content(
             if page_num > start_page and not page_belongs_to_codes(page, codes):
                 break
 
+            last_processed = page_num
+
             # ── Footer page label ─────────────────────────────────────────────
             ref = read_page_ref(page)
             if page_num == start_page:
                 start_page_ref_footer = ref
             end_page_ref = ref
 
-            # ── Text ──────────────────────────────────────────────────────────
-            raw_text   = page.get_text("text")
-            full_text += clean_text(raw_text) + "\n\n"
+            pw = page.rect.width
+            ph = page.rect.height
+
+            # ── Raw text (unprocessed) ────────────────────────────────────────
+            raw_text_parts.append(page.get_text("text"))
 
             # ── Images ────────────────────────────────────────────────────────
             for img_info in page.get_images(full=True):
@@ -185,54 +209,83 @@ def extract_content(
                         f.write(img_bytes)
                     seen_hashes[img_hash] = img_filename
 
-                image_filenames.append(seen_hashes[img_hash])
+                # Store metadata — image_id is assigned later in extractor.py
+                image_list.append({
+                    "filename": seen_hashes[img_hash],
+                    "pdf_page": page_num,
+                    "page_ref": ref,
+                })
                 img_counter += 1
                 has_images = True
 
-            # ── Tables per zone ───────────────────────────────────────────────
-            pw = page.rect.width
-            ph = page.rect.height
+            # ── Section detection ─────────────────────────────────────────────
+            # Find all known headings on this page and sort them top-to-bottom by y.
+            breaks = []   # (y_bottom_of_heading, display_name, role)
+            for display_name, role in KNOWN_HEADINGS:
+                y = _find_heading_y(page, display_name)
+                if y is not None:
+                    breaks.append((y, display_name, role))
+            breaks.sort(key=lambda x: x[0])
 
-            dtc_logic_y = _find_heading_y(page, "dtc logic")
-            diagnosis_y = _find_heading_y(page, "diagnosis procedure")
+            if not breaks:
+                # No headings on this page — entire page continues active section
+                if active_section is not None:
+                    text = _clean_zone_text(page, fitz.Rect(0, 0, pw, ph))
+                    if text:
+                        active_section["text_parts"].append(text)
+                    for rows in extract_tables_from_rect(page, fitz.Rect(0, 0, pw, ph)):
+                        active_section["tables"].append({"page": page_num, "page_ref": ref, "rows": rows})
+                    active_section["page_end"] = page_num
 
-            # Zone 1 — DTC Logic
-            if dtc_logic_y is not None:
-                # Heading found on this page — enter dtc_logic zone
-                in_dtc_logic = True
-                in_diagnosis = False
-                bottom = diagnosis_y if diagnosis_y is not None else ph
-                dtc_logic_tables.extend(
-                    extract_tables_from_rect(page, fitz.Rect(0, dtc_logic_y, pw, bottom))
-                )
-            elif in_dtc_logic:
-                # Continuation page in dtc_logic zone
-                bottom = diagnosis_y if diagnosis_y is not None else ph
-                dtc_logic_tables.extend(
-                    extract_tables_from_rect(page, fitz.Rect(0, 0, pw, bottom))
-                )
+            else:
+                # ── Content before the first heading ─────────────────────────
+                # Belongs to the active section (it's a continuation from a previous page).
+                first_y = breaks[0][0]
+                if first_y > 0 and active_section is not None:
+                    pre_rect = fitz.Rect(0, 0, pw, first_y)
+                    pre_text = _clean_zone_text(page, pre_rect)
+                    if pre_text:
+                        active_section["text_parts"].append(pre_text)
+                    for rows in extract_tables_from_rect(page, pre_rect):
+                        active_section["tables"].append({"page": page_num, "page_ref": ref, "rows": rows})
+                    active_section["page_end"] = page_num
 
-            # Zone 2 — Diagnosis Procedure
-            if diagnosis_y is not None:
-                # Heading found on this page — enter diagnosis zone
-                in_diagnosis = True
-                in_dtc_logic = False
-                diagnosis_procedure_tables.extend(
-                    extract_tables_from_rect(page, fitz.Rect(0, diagnosis_y, pw, ph))
-                )
-            elif in_diagnosis:
-                # Continuation page in diagnosis zone
-                diagnosis_procedure_tables.extend(
-                    extract_tables_from_rect(page, fitz.Rect(0, 0, pw, ph))
-                )
+                # ── Process each heading zone ─────────────────────────────────
+                for i, (y, display_name, role) in enumerate(breaks):
+                    # Close the section that was active before this heading
+                    if active_section is not None:
+                        all_sections.append(_finalize_section(active_section))
+
+                    # Zone runs from this heading's y to the next heading's y (or page bottom)
+                    y_end     = breaks[i + 1][0] if i + 1 < len(breaks) else ph
+                    zone_rect = fitz.Rect(0, y, pw, y_end)
+
+                    zone_text   = _clean_zone_text(page, zone_rect)
+                    zone_tables = [
+                        {"page": page_num, "page_ref": ref, "rows": rows}
+                        for rows in extract_tables_from_rect(page, zone_rect)
+                    ]
+
+                    # Open new section
+                    active_section = {
+                        "heading":    display_name,
+                        "role":       role,
+                        "text_parts": [zone_text] if zone_text else [],
+                        "tables":     zone_tables,
+                        "page_start": page_num,
+                        "page_end":   page_num,
+                    }
+
+        # Close the last open section after the page loop ends
+        if active_section is not None:
+            all_sections.append(_finalize_section(active_section))
 
     return {
-        "text":                        full_text.strip(),
-        "has_images":                  has_images,
-        "images":                      image_filenames,
-        "start_page_ref_footer":       start_page_ref_footer,
-        "end_page_ref":                end_page_ref,
-        "end_pdf_page":                page_num - 1,
-        "dtc_logic_tables":            dtc_logic_tables,
-        "diagnosis_procedure_tables":  diagnosis_procedure_tables,
+        "raw_text":               "\n\n".join(raw_text_parts).strip(),
+        "sections":               all_sections,
+        "has_images":             has_images,
+        "image_list":             image_list,
+        "start_page_ref_footer":  start_page_ref_footer,
+        "end_page_ref":           end_page_ref,
+        "end_pdf_page":           last_processed,
     }
