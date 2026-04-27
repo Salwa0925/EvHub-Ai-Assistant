@@ -40,10 +40,13 @@ def page_belongs_to_codes(page: fitz.Page, codes: list) -> bool:
     return any(code.upper() in top_text for code in codes)
 
 
-def _find_heading_y(page: fitz.Page, heading: str) -> float | None:
+def _find_heading_y(page: fitz.Page, heading: str) -> tuple[float, float] | None:
     """
-    Find the bottom y-coordinate of a heading line on a page.
+    Find the y-coordinates of a heading line on a page.
     Searches every line in every block (case-insensitive exact match).
+    Returns (y_top, y_bottom) so callers can:
+      - end the previous zone at y_top  (before the heading text)
+      - start the new zone at y_bottom  (after the heading text)
     Returns None if not found.
     """
     heading_lower = heading.lower()
@@ -55,7 +58,7 @@ def _find_heading_y(page: fitz.Page, heading: str) -> float | None:
                 span["text"] for span in line.get("spans", [])
             ).strip().lower()
             if line_text == heading_lower:
-                return line["bbox"][3]  # y1 — bottom edge of this line
+                return line["bbox"][1], line["bbox"][3]  # (y_top, y_bottom)
     return None
 
 
@@ -219,8 +222,9 @@ def extract_content(
         sections                 — list of section dicts with text, tables, page range
         has_images               — True if any images were saved
         image_list               — list of image metadata dicts (filename, pdf_page, page_ref)
-        start_page_ref_footer    — footer label on first page (cross-check)
-        end_page_ref             — footer label on last page
+        page_refs                — ordered list of all footer page labels seen (full span)
+        start_page_ref_footer    — footer label on first page (for cross-check in extractor)
+        end_page_ref             — footer label on last page (for cross-check in extractor)
         end_pdf_page             — physical PDF page of last page (1-indexed)
     """
     with fitz.open(str(pdf_path)) as pdf:
@@ -230,6 +234,7 @@ def extract_content(
         has_images            = False
         image_list            = []   # image metadata, IDs assigned later in extractor.py
         img_counter           = 1
+        all_page_refs         = []   # ordered footer labels for every page in this block
         start_page_ref_footer = None
         end_page_ref          = None
         last_processed        = start_page
@@ -253,6 +258,8 @@ def extract_content(
             if page_num == start_page:
                 start_page_ref_footer = ref
             end_page_ref = ref
+            if ref and ref not in all_page_refs:
+                all_page_refs.append(ref)
 
             pw = page.rect.width
             ph = page.rect.height
@@ -292,12 +299,16 @@ def extract_content(
                 has_images = True
 
             # ── Section detection ─────────────────────────────────────────────
-            # Find all known headings on this page and sort them top-to-bottom by y.
-            breaks = []   # (y_bottom_of_heading, display_name, role)
+            # Find all known headings on this page and sort them top-to-bottom.
+            # Each entry: (y_top, y_bottom, display_name, role)
+            # y_top  — used to END the previous zone (stops before heading text)
+            # y_bottom — used to START this zone (starts after heading text)
+            breaks = []
             for display_name, role in KNOWN_HEADINGS:
-                y = _find_heading_y(page, display_name)
-                if y is not None:
-                    breaks.append((y, display_name, role))
+                result = _find_heading_y(page, display_name)
+                if result is not None:
+                    y_top, y_bottom = result
+                    breaks.append((y_top, y_bottom, display_name, role))
             breaks.sort(key=lambda x: x[0])
 
             if not breaks:
@@ -312,10 +323,11 @@ def extract_content(
 
             else:
                 # ── Content before the first heading ─────────────────────────
-                # Belongs to the active section (it's a continuation from a previous page).
-                first_y = breaks[0][0]
-                if first_y > 0 and active_section is not None:
-                    pre_rect = fitz.Rect(0, 0, pw, first_y)
+                # Belongs to the active section (continuation from a previous page).
+                # Clip to y_top so the heading text itself is excluded.
+                first_y_top = breaks[0][0]
+                if first_y_top > 0 and active_section is not None:
+                    pre_rect = fitz.Rect(0, 0, pw, first_y_top)
                     pre_text = _clean_zone_text(page, pre_rect)
                     if pre_text:
                         active_section["text_parts"].append(pre_text)
@@ -324,14 +336,16 @@ def extract_content(
                     active_section["page_end"] = page_num
 
                 # ── Process each heading zone ─────────────────────────────────
-                for i, (y, display_name, role) in enumerate(breaks):
+                for i, (y_top, y_bottom, display_name, role) in enumerate(breaks):
                     # Close the section that was active before this heading
                     if active_section is not None:
                         all_sections.append(_finalize_section(active_section))
 
-                    # Zone runs from this heading's y to the next heading's y (or page bottom)
+                    # Zone runs from y_bottom of this heading to y_top of the
+                    # next heading (or page bottom).  Using y_top of the next
+                    # heading means the next heading's text is NOT included here.
                     y_end     = breaks[i + 1][0] if i + 1 < len(breaks) else ph
-                    zone_rect = fitz.Rect(0, y, pw, y_end)
+                    zone_rect = fitz.Rect(0, y_bottom, pw, y_end)
 
                     zone_text   = _clean_zone_text(page, zone_rect)
                     zone_tables = [
@@ -358,6 +372,7 @@ def extract_content(
         "sections":               all_sections,
         "has_images":             has_images,
         "image_list":             image_list,
+        "page_refs":              all_page_refs,
         "start_page_ref_footer":  start_page_ref_footer,
         "end_page_ref":           end_page_ref,
         "end_pdf_page":           last_processed,

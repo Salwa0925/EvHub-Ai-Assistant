@@ -5,6 +5,7 @@ Extraction logic for one manual PDF.
 Called by pipeline.py.
 """
 
+import re
 import hashlib
 from pathlib import Path
 
@@ -12,6 +13,102 @@ from pdf_profile import profile_pdf
 from index_builder import build_index
 from content_extractor import extract_content
 from vehicle_info import extract_vehicle_info
+
+
+def _common_title_prefix(titles: list[str]) -> str:
+    """
+    Return the longest common word-level prefix shared by all titles.
+    E.g. ["CELL OVER DISCHARGE MODULE25", "CELL OVER DISCHARGE MODULE26"]
+         -> "CELL OVER DISCHARGE"
+    """
+    if not titles:
+        return ""
+    split = [t.split() for t in titles]
+    min_len = min(len(s) for s in split)
+    common = []
+    for i in range(min_len):
+        word = split[0][i]
+        if all(s[i] == word for s in split):
+            common.append(word)
+        else:
+            break
+    return " ".join(common)
+
+
+def _normalize_title(codes: list, code_titles: dict) -> str | None:
+    """
+    Build a compact title for a DTC record.
+    Single code  -> "P0A0D HV SYSTEM INTERLOCK ERROR"
+    Multiple codes -> "P3031-P303C CELL CONT"  (code range + common title prefix)
+    Sidebar letters (e.g. 'E CELL CONT ASIC4') are stripped before comparison.
+    """
+    raw_titles = [code_titles.get(c, "") for c in codes if code_titles.get(c)]
+    if not raw_titles:
+        return None
+    # Strip inline sidebar prefix: a single uppercase letter at the start
+    # e.g. "E CELL CONT ASIC4" -> "CELL CONT ASIC4"
+    # Only strips a single leading letter — won't touch "DLC DIAGNOSIS VCM"
+    _leading = re.compile(r'^[A-Z] ')
+    titles = [_leading.sub("", t).strip() for t in raw_titles]
+    titles = [t for t in titles if t]
+    if not titles:
+        return None
+
+    if len(codes) == 1:
+        return f"{codes[0]} {titles[0]}".strip()
+
+    sorted_codes = sorted(codes)
+    first_code   = sorted_codes[0]
+    last_code    = sorted_codes[-1]
+    common       = _common_title_prefix(titles)
+    if common:
+        return f"{first_code}-{last_code} {common}"
+    return f"{first_code}-{last_code}"
+
+
+def _merge_continued_tables(tables: list, notes: list) -> list:
+    """
+    Merge tables that continue across pages within the same section.
+    Two consecutive tables are considered a continuation when they share
+    the same section_id and identical first rows (header).
+    The duplicate header row is dropped from the second table onward.
+    A note is appended to `notes` for each merge.
+    """
+    if not tables:
+        return tables
+
+    merged = []
+    skip   = set()
+
+    for i, tbl in enumerate(tables):
+        if i in skip:
+            continue
+
+        combined     = dict(tbl)
+        combined["rows"] = list(tbl["rows"])
+        pages_merged = [tbl["page_ref"] or str(tbl["page"])]
+
+        for j in range(i + 1, len(tables)):
+            if j in skip:
+                continue
+            nxt = tables[j]
+            if (nxt["section_id"] == tbl["section_id"]
+                    and nxt["rows"] and tbl["rows"]
+                    and nxt["rows"][0] == tbl["rows"][0]):
+                combined["rows"].extend(nxt["rows"][1:])
+                pages_merged.append(nxt["page_ref"] or str(nxt["page"]))
+                skip.add(j)
+            else:
+                break   # only merge consecutive tables in the same section
+
+        if len(pages_merged) > 1:
+            notes.append(
+                f"table {tbl['table_id']} continued across pages: {', '.join(pages_merged)}"
+            )
+
+        merged.append(combined)
+
+    return merged
 
 
 def _make_record_id(document_id: str, start_pdf_page: int) -> str:
@@ -87,17 +184,11 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
             warnings.append(msg)
 
         # ── page_refs list ────────────────────────────────────────────────────
-        # Build a list of unique page refs spanning this DTC block (start to end).
-        start_ref = page_to_ref.get(page_num) or content["start_page_ref_footer"]
-        end_ref   = content["end_page_ref"]
-        if start_ref == end_ref or end_ref is None:
-            page_refs = [start_ref] if start_ref else []
-        else:
-            page_refs = [r for r in [start_ref, end_ref] if r]
+        # Full ordered list of footer labels seen across all pages of this block.
+        page_refs = content["page_refs"]
 
         # ── DTC title ─────────────────────────────────────────────────────────
-        titles    = list(dict.fromkeys([code_titles.get(c, "") for c in codes if code_titles.get(c)]))
-        dtc_title = " / ".join(titles) if titles else None
+        dtc_title = _normalize_title(codes, code_titles)
 
         # ── Sections — assign section_id to each ─────────────────────────────
         sections = []
@@ -112,6 +203,7 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
             })
 
         # ── Tables — flat list, each linked to its section via section_id ─────
+        notes   = []
         tables  = []
         t_count = 1
         for s_idx, sec in enumerate(content["sections"]):
@@ -127,6 +219,9 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
                     "rows":           tbl["rows"],
                 })
                 t_count += 1
+
+        # Merge tables that continue across pages (same section, same header row)
+        tables = _merge_continued_tables(tables, notes)
 
         # ── Images — enriched with metadata ──────────────────────────────────
         images = []
@@ -157,7 +252,7 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
             "sections": sections,
             "tables":   tables,
             "images":   images,
-            "notes":    [],     # reserved for WARNING/CAUTION blocks — extraction not yet implemented
+            "notes":    notes,
 
             "raw_text": content["raw_text"],
 
