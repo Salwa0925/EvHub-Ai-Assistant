@@ -155,16 +155,24 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
         row_ranges = _row_y_ranges(table)
 
         if table.bbox[0] - line_left > 5:
-            for r_idx, (ry0, ry1) in enumerate(row_ranges):
+            col = []
+            for ry0, ry1 in row_ranges:
                 clip = fitz.Rect(line_left, ry0, table.bbox[0], ry1)
-                text = page.get_text("text", clip=clip).strip()
-                clean_rows[r_idx].insert(0, text)
+                col.append(page.get_text("text", clip=clip).strip())
+            # Skip sidebar noise: real content has at least one token > 4 chars.
+            # Sidebar letters (A-Z, EVB, etc.) are always 1-3 chars per token.
+            if any(len(tok) > 4 for v in col for tok in v.split()):
+                for r_idx, v in enumerate(col):
+                    clean_rows[r_idx].insert(0, v)
 
         if line_right - table.bbox[2] > 5:
-            for r_idx, (ry0, ry1) in enumerate(row_ranges):
+            col = []
+            for ry0, ry1 in row_ranges:
                 clip = fitz.Rect(table.bbox[2], ry0, line_right, ry1)
-                text = page.get_text("text", clip=clip).strip()
-                clean_rows[r_idx].append(text)
+                col.append(page.get_text("text", clip=clip).strip())
+            if any(len(tok) > 4 for v in col for tok in v.split()):
+                for r_idx, v in enumerate(col):
+                    clean_rows[r_idx].append(v)
 
         result.append(clean_rows)
 
