@@ -15,6 +15,7 @@ from pathlib import Path
 
 from extractor import extract_records
 from pdf_profile import profile_pdf
+from llm_formatter import format_document
 
 
 def main():
@@ -135,6 +136,16 @@ def main():
                 json.dump(result, f, indent=2, ensure_ascii=False)
 
             tmp_path.rename(out_path)   # instant rename — cannot be interrupted halfway
+
+            # ── LLM-friendly output ───────────────────────────────────────────
+            # Derived representation — raw v4 file above is the source of truth.
+            # This strips raw_text, raw_rows, and noise so consumers don't pay
+            # for duplicate tokens.  Written atomically like the v4 file.
+            llm_path = out_dir / f"{pdf_path.stem}_llm.json"
+            llm_tmp  = llm_path.with_suffix(".json.tmp")
+            with open(llm_tmp, 'w', encoding='utf-8') as f:
+                json.dump(format_document(result), f, indent=2, ensure_ascii=False)
+            llm_tmp.replace(llm_path)
 
             print(f"  Saved {len(result['records'])} records to {out_path}")
             report.append({"file": pdf_path.name, "pdf_type": pdf_type, "status": "extracted", "records": len(result["records"])})
