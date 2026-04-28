@@ -152,6 +152,18 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
             for row in rows
         ]
 
+        # Strip blob row: fitz sometimes dumps all continuation text into
+        # cell[0][0] (multi-line string) with all other cells empty.
+        # This happens on cross-page tables where the header is reprinted —
+        # the rows before the new header have no column boundaries for fitz
+        # to split on, so everything ends up in one cell.
+        # Condition: first row, first cell contains a newline, all other cells empty.
+        if (len(clean_rows) > 1
+                and clean_rows[0][0]
+                and '\n' in clean_rows[0][0]
+                and all(c == '' for c in clean_rows[0][1:])):
+            clean_rows = clean_rows[1:]
+
         # Recover columns hidden outside the detected table bbox.
         # Threshold: only act if the extension is more than 5 pt.
         line_left, line_right = _get_line_extent(page, table.bbox)
