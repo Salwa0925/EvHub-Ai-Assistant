@@ -96,20 +96,90 @@ def extract_codes_with_y(page, fmt: str) -> list:
     return results
 
 
+# Tuning constants for row/block-aware link matching
+_ROW_Y_TOL  = 4    # pt — codes within this Y band are treated as one visual row
+_LINK_Y_TOL = 20   # pt — a link's midY must be within this of a row's Y to match
+_BLOCK_GAP  = 40   # pt — Y gap larger than this between rows starts a new block
+
+
 def match_codes_to_links(codes_with_y: list, links: list) -> dict:
     """
-    Match each DTC code to its nearest internal link by y-distance.
-    Returns: { "U1000": {"page": 181, "title": "HV SYSTEM INTERLOCK ERROR"}, ... }
+    Match each DTC code row to its page-ref hyperlink using row/block-aware matching.
+
+    The old implementation used an unconditional nearest-link search, which caused
+    codes on different rows to incorrectly share a single link when only one link
+    happened to be present on the index page.
+
+    Algorithm
+    ---------
+    1. Sort codes by Y and group into rows (_ROW_Y_TOL): codes within 4 pt of each
+       other in Y share the same visual row.  DTC ranges (P3031-P303C) that land on
+       the same row naturally share one link this way.
+    2. Group consecutive rows into blocks (_BLOCK_GAP): a Y gap larger than 40 pt
+       between two adjacent rows signals a section break or heading, starting a new
+       block.  Links from one block are never used to match codes in another block.
+    3. For each block, collect candidate links whose midY falls within the block's
+       Y span (padded by _LINK_Y_TOL).
+    4. For each row, pick the nearest candidate link whose midY is within
+       _LINK_Y_TOL of the row's Y.  If none qualifies, skip the row and emit a
+       warning — better to drop the code than to assign a wrong page.
+    5. All codes in the same row receive the same match result.
+
+    Returns: { code: {"page": int, "title": str, "page_ref": str|None}, ... }
     """
-    results = {}
+    if not links or not codes_with_y:
+        return {}
 
-    if not links:
-        return results
+    def link_midy(lnk: dict) -> float:
+        r = lnk["from"]
+        return (r.y0 + r.y1) / 2
 
-    for code, code_y, title in codes_with_y:
-        nearest = min(links, key=lambda l: abs(l["from"].y0 - code_y))
-        target_page = nearest["page"] + 1
-        results[code] = {"page": target_page, "title": title, "page_ref": nearest.get("ref_text")}
+    # ── Step 1: group codes into rows ─────────────────────────────────────────
+    rows: list[dict] = []
+    for code, y, title in sorted(codes_with_y, key=lambda x: x[1]):
+        if rows and abs(y - rows[-1]["y"]) <= _ROW_Y_TOL:
+            rows[-1]["items"].append((code, y, title))
+        else:
+            rows.append({"y": y, "items": [(code, y, title)]})
+
+    # ── Step 2: group rows into blocks ────────────────────────────────────────
+    blocks: list[list[dict]] = [[rows[0]]]
+    for row in rows[1:]:
+        if row["y"] - blocks[-1][-1]["y"] > _BLOCK_GAP:
+            blocks.append([])
+        blocks[-1].append(row)
+
+    # ── Steps 3-4: match rows to links ────────────────────────────────────────
+    results: dict = {}
+
+    for block in blocks:
+        b_top    = block[0]["y"]  - _LINK_Y_TOL
+        b_bottom = block[-1]["y"] + _LINK_Y_TOL
+        block_links = [lnk for lnk in links
+                       if b_top <= link_midy(lnk) <= b_bottom]
+
+        for row in block:
+            ry     = row["y"]
+            nearby = [lnk for lnk in block_links
+                      if abs(link_midy(lnk) - ry) <= _LINK_Y_TOL]
+
+            if not nearby:
+                codes_str = ", ".join(c[0] for c in row["items"])
+                print(f"  [WARN index-match] no link for [{codes_str}] at Y={ry:.1f} "
+                      f"(block Y {block[0]['y']:.0f}-{block[-1]['y']:.0f}, "
+                      f"{len(block_links)} block links)")
+                continue
+
+            best        = min(nearby, key=lambda lnk: abs(link_midy(lnk) - ry))
+            target_page = best["page"] + 1
+            ref_text    = best.get("ref_text")
+
+            for code, _y, title in row["items"]:
+                results[code] = {
+                    "page":     target_page,
+                    "title":    title,
+                    "page_ref": ref_text,
+                }
 
     return results
 

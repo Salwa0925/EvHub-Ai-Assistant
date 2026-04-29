@@ -103,6 +103,112 @@ def _row_y_ranges(table) -> list[tuple[float, float]]:
     return [(y_sorted[i], y_sorted[i + 1]) for i in range(len(y_sorted) - 1)]
 
 
+def _bbox_rebuild_table(page: fitz.Page, table_rect: fitz.Rect) -> list[list[str]]:
+    """
+    Reconstruct table rows using word-level X/Y positions.
+
+    Used as a repair fallback when find_tables() drops outer columns due to
+    absent vertical border lines or merged cells spanning the table edge.
+
+    Generic across manufacturers and PDF layouts — no hardcoded column names
+    or fixed pixel assumptions.  All thresholds are derived from the actual
+    word geometry of the table being processed.
+
+    Algorithm:
+      1. Collect all words in table_rect via page.get_text("words").
+      2. Cluster words into rows by Y-centre (ROW_TOL = 40% of median word height).
+      3. Within each row, merge adjacent words into cell tokens (gap <= WORD_GAP pt).
+      4. Cluster token X0 positions into column starts (X0_TOL = 5 pt within-column
+         tolerance).  Rounding to 1 pt before clustering absorbs PDF sub-pixel noise.
+      5. Assign each token to its nearest column start; build cell strings.
+      6. Drop columns present in fewer than 20% of rows (sidebar letters, page
+         numbers, other per-page noise outside the real table body).
+
+    Returns [] when the rect yields fewer than 2 rows or fewer than 2 valid
+    columns after the fill filter — caller keeps original clean_rows.
+    """
+    words = page.get_text("words", clip=table_rect)
+    if not words:
+        return []
+
+    WORD_GAP = 8    # pt — intra-cell word spacing; stable across font sizes
+    X0_TOL   = 5    # pt — within-column X0 clustering tolerance
+
+    # ROW_TOL derived from median word height so clustering adapts to font size.
+    # 40% of word height handles multi-word cells without merging adjacent rows.
+    word_heights = [w[3] - w[1] for w in words if w[3] > w[1]]
+    median_h     = sorted(word_heights)[len(word_heights) // 2] if word_heights else 10.0
+    ROW_TOL      = max(2.0, median_h * 0.4)
+
+    # ── 1. Cluster words into rows by Y centre ────────────────────────────
+    rows_raw: list[list] = []
+    for w in sorted(words, key=lambda w: w[1]):        # top-to-bottom by y0
+        yc = (w[1] + w[3]) / 2
+        if rows_raw:
+            last_yc = sum((x[1] + x[3]) / 2 for x in rows_raw[-1]) / len(rows_raw[-1])
+            if abs(yc - last_yc) <= ROW_TOL:
+                rows_raw[-1].append(w)
+                continue
+        rows_raw.append([w])
+
+    if len(rows_raw) < 2:
+        return []
+
+    # ── 2. Merge adjacent words → cell tokens ─────────────────────────────
+    # Each token stored as (x0, x1, text).
+    token_rows: list[list[tuple]] = []
+    for row in rows_raw:
+        row.sort(key=lambda w: w[0])                   # left-to-right by x0
+        tokens: list[tuple] = []
+        for w in row:
+            x0, x1, text = w[0], w[2], w[4]
+            if tokens and x0 - tokens[-1][1] <= WORD_GAP:
+                tokens[-1] = (tokens[-1][0], x1, tokens[-1][2] + ' ' + text)
+            else:
+                tokens.append((x0, x1, text))
+        token_rows.append(tokens)
+
+    # ── 3. Derive column start positions from all token X0 values ─────────
+    # Round to 1 pt first to absorb PDF sub-pixel variation within a column.
+    # Then cluster rounded X0 values: positions within X0_TOL pt belong to
+    # the same column.  Columns only a few pt apart are still separated;
+    # within-column X0 drift (< 3 pt in practice) is correctly merged.
+    all_x0 = sorted({round(t[0]) for row in token_rows for t in row})
+    col_starts: list[float] = []
+    for x in all_x0:
+        if not col_starts or x - col_starts[-1] >= X0_TOL:
+            col_starts.append(float(x))
+
+    if not col_starts:
+        return []
+
+    n_cols = len(col_starts)
+
+    # ── 4. Assign tokens to columns ───────────────────────────────────────
+    result: list[list[str]] = []
+    for tokens in token_rows:
+        cells = [''] * n_cols
+        for t in tokens:
+            col_idx = min(range(n_cols), key=lambda i: abs(t[0] - col_starts[i]))
+            cells[col_idx] = (cells[col_idx] + ' ' + t[2]).strip() if cells[col_idx] else t[2]
+        result.append(cells)
+
+    # ── 5. Drop spurious columns ──────────────────────────────────────────
+    # A real column has content in at least 20% of rows.  Columns below that
+    # threshold are sidebar letters, page numbers, or other per-page noise
+    # that happens to fall inside the repair rect.
+    min_presence = max(1, round(len(result) * 0.20))
+    valid_idxs   = [i for i in range(n_cols)
+                    if sum(1 for row in result if row[i]) >= min_presence]
+    if len(valid_idxs) < 2:
+        return []
+    if len(valid_idxs) < n_cols:
+        result  = [[row[i] for i in valid_idxs] for row in result]
+        n_cols  = len(valid_idxs)   # noqa: F841 — kept for clarity
+
+    return result
+
+
 def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
     """
     Extract tables whose bounding box overlaps rect by at least 50%.
@@ -192,6 +298,25 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
             if any(len(tok) > 4 for v in col for tok in v.split()):
                 for r_idx, v in enumerate(col):
                     clean_rows[r_idx].append(v)
+
+        # ── Bbox repair pass ──────────────────────────────────────────────────
+        # Word-position reconstruction over the full horizontal rule extent.
+        # Only replaces clean_rows when:
+        #   (a) bbox found more columns than find_tables(), AND
+        #   (b) confidence is sufficient: >= 50% of rows have content in at
+        #       least half the detected columns.  Low fill means the extra
+        #       columns are mostly empty (noise) — keep original in that case.
+        repair_rect = fitz.Rect(line_left, tbbox.y0, line_right, tbbox.y1)
+        bbox_rows = _bbox_rebuild_table(page, repair_rect)
+        if bbox_rows and clean_rows and len(bbox_rows[0]) > len(clean_rows[0]):
+            min_filled = max(1, len(bbox_rows[0]) // 2)
+            good_rows  = sum(1 for row in bbox_rows
+                             if sum(1 for c in row if c) >= min_filled)
+            if good_rows / len(bbox_rows) >= 0.5:
+                clean_rows = [
+                    [" ".join(c.split()) for c in row]
+                    for row in bbox_rows
+                ]
 
         result.append(clean_rows)
 

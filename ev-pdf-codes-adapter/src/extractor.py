@@ -440,6 +440,84 @@ def _detect_carry_forward_cols(data_rows: list, key_col_idx: int) -> set:
     return candidates
 
 
+def _is_placeholder_header_cell(cell: str) -> bool:
+    """Return True if a header cell is empty, dash-only, or symbol-only (placeholder)."""
+    v = cell.strip()
+    if not v:
+        return True
+    if re.match(r'^[-—–\s]+$', v):
+        return True
+    if not re.search(r'[a-zA-Z0-9]', v):
+        return True
+    return False
+
+
+def _collect_quality_flags(
+    raw_rows: list,
+    n_header: int,
+    header_cells: list,
+    data_rows: list,
+    known_codes: set | None = None,
+) -> list[str]:
+    """
+    Inspect table structure and return quality flag strings for suspicious patterns.
+
+    Flags (included only when the condition is met):
+      multi_row_header_detected     — header spans 2 rows
+      merged_header_cells_detected  — a row0 cell spans across a row1 gap position
+      placeholder_header_detected   — a header cell is empty, dash-only, or symbol-only
+      suspicious_normalized_headers — column slugs are generic ("col") or duplicated
+      repeated_header_row_detected  — a data row closely matches the header row content
+    """
+    flags: list[str] = []
+
+    # 1. Multi-row header
+    if n_header == 2:
+        flags.append("multi_row_header_detected")
+
+    # 2. Merged header cells — row0 has a value where row1 is empty (spanning cell)
+    if n_header == 2 and len(raw_rows) >= 2:
+        row0 = raw_rows[0]
+        row1 = raw_rows[1]
+        n = max(len(row0), len(row1))
+        for i in range(n):
+            a = str(row0[i]).strip() if i < len(row0) else ''
+            b = str(row1[i]).strip() if i < len(row1) else ''
+            if a and not b:
+                flags.append("merged_header_cells_detected")
+                break
+
+    # 3. Placeholder header cell (empty, dash-only, symbol-only)
+    for cell in header_cells:
+        if _is_placeholder_header_cell(str(cell)):
+            flags.append("placeholder_header_detected")
+            break
+
+    # 4. Suspicious normalized headers — generic slugs or duplicates before deduplication
+    seen_slugs: dict[str, int] = {}
+    for cell in header_cells:
+        slug = _slugify(cell) if (cell and str(cell).strip()) else "col"
+        seen_slugs[slug] = seen_slugs.get(slug, 0) + 1
+    if any(k == "col" for k in seen_slugs) or any(v > 1 for v in seen_slugs.values()):
+        flags.append("suspicious_normalized_headers")
+
+    # 5. Repeated header row — a data row closely matches the original header row
+    if n_header >= 1 and raw_rows and data_rows:
+        orig_header = [str(c).strip().lower() for c in raw_rows[0]]
+        for row in data_rows:
+            row_lower = [str(c).strip().lower() for c in row]
+            n = max(len(orig_header), len(row_lower))
+            padded_h = (orig_header + [''] * n)[:n]
+            padded_r = (row_lower + [''] * n)[:n]
+            total_h = sum(1 for a in padded_h if a)
+            matches = sum(1 for a, b in zip(padded_h, padded_r) if a and a == b)
+            if total_h > 0 and matches / total_h >= 0.5:
+                flags.append("repeated_header_row_detected")
+                break
+
+    return flags
+
+
 def _analyze_table(raw_rows: list, role: str | None = None, known_codes: set | None = None) -> dict:
     """
     Analyze a raw table and produce a semantic_parse result.
@@ -480,6 +558,7 @@ def _analyze_table(raw_rows: list, role: str | None = None, known_codes: set | N
     # Guard: if row 0 contains DTC codes it is a data row, not a header.
     # DTC codes (P303D, P338A, etc.) are values — they must never become
     # column names.  Use canonical headers for known roles; fail otherwise.
+    n_header = 0  # 0 = canonical fallback used (no text header row in the PDF)
     if _row_has_dtc_codes(raw_rows[0], known_codes):
         canonical = _CANONICAL_HEADERS.get(role)
         if canonical:
@@ -513,6 +592,9 @@ def _analyze_table(raw_rows: list, role: str | None = None, known_codes: set | N
 
     n_cols = len(keys)
     stats  = _column_stats(data_rows, n_cols)
+
+    # ── Collect quality flags ─────────────────────────────────────────────────
+    quality_flags = _collect_quality_flags(raw_rows, n_header, header_cells, data_rows, known_codes)
 
     # ── Try: shared_fields ────────────────────────────────────────────────────
     pk_idx = _detect_primary_key(stats, known_codes)
@@ -555,14 +637,18 @@ def _analyze_table(raw_rows: list, role: str | None = None, known_codes: set | N
                 rec[keys[idx]] = padded[idx]
             individual.append(rec)
 
-        return {
-            "status":             "ok",
+        result = {
+            "status":             "ok" if not quality_flags else "partial",
             "table_type":         "shared_fields",
             "primary_key":        pk_name,
             "primary_key_values": pk_values,
             "shared":             shared_cols,
             "individual":         individual,
         }
+        if quality_flags:
+            result["quality_flags"] = quality_flags
+            result["raw_rows_preferred"] = True
+        return result
 
     # ── Try: grouped_rows ─────────────────────────────────────────────────────
     sparse_idx = _detect_sparse_key(data_rows, n_cols, known_codes)
@@ -602,13 +688,17 @@ def _analyze_table(raw_rows: list, role: str | None = None, known_codes: set | N
         if current is not None:
             groups.append(current)
 
-        return {
-            "status":     "ok",
+        result = {
+            "status":     "ok" if not quality_flags else "partial",
             "table_type": "grouped_rows",
             "key_column": key_name,
             "header":     keys,
             "groups":     groups,
         }
+        if quality_flags:
+            result["quality_flags"] = quality_flags
+            result["raw_rows_preferred"] = True
+        return result
 
     # ── Fallback: flat ────────────────────────────────────────────────────────
     flat_rows = []
@@ -616,12 +706,16 @@ def _analyze_table(raw_rows: list, role: str | None = None, known_codes: set | N
         padded = (list(row) + [''] * n_cols)[:n_cols]
         flat_rows.append(dict(zip(keys, padded)))
 
-    return {
-        "status":     "partial",
-        "table_type": "flat",
-        "header":     keys,
-        "rows":       flat_rows,
+    result = {
+        "status":             "partial",
+        "raw_rows_preferred": True,
+        "table_type":         "flat",
+        "header":             keys,
+        "rows":               flat_rows,
     }
+    if quality_flags:
+        result["quality_flags"] = quality_flags
+    return result
 
 
 def _make_record_id(document_id: str, start_pdf_page: int) -> str:
