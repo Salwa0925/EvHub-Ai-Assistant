@@ -146,23 +146,27 @@ def extract_tables_from_rect(page: fitz.Page, rect: fitz.Rect) -> list:
         if not rows[0] or len(rows[0]) < 2:
             continue
 
-        # Normalise cells: None -> "", strip whitespace
+        # Strip blob row BEFORE normalisation (newlines are still present in raw rows).
+        # fitz sometimes dumps all continuation text into cell[0][0] (multi-line string)
+        # with all other cells empty.  This happens on cross-page tables where the header
+        # is reprinted — the rows before the new header have no column boundaries for fitz
+        # to split on, so everything ends up in one cell.
+        # Condition: first row, first cell contains a newline, all other cells empty/None.
+        if (len(rows) > 1
+                and rows[0] is not None
+                and rows[0][0] is not None
+                and '\n' in str(rows[0][0])
+                and all((c is None or c == '') for c in rows[0][1:])):
+            rows = rows[1:]
+
+        # Normalise cells: None -> "", collapse internal newlines, strip whitespace.
+        # Collapsing newlines fixes simple line-break splits that fitz produces
+        # when a cell wraps across two printed lines (e.g. "Battery\nvoltage" ->
+        # "Battery voltage").
         clean_rows = [
-            [str(cell).strip() if cell is not None else "" for cell in row]
+            [" ".join(str(cell).split()) if cell is not None else "" for cell in row]
             for row in rows
         ]
-
-        # Strip blob row: fitz sometimes dumps all continuation text into
-        # cell[0][0] (multi-line string) with all other cells empty.
-        # This happens on cross-page tables where the header is reprinted —
-        # the rows before the new header have no column boundaries for fitz
-        # to split on, so everything ends up in one cell.
-        # Condition: first row, first cell contains a newline, all other cells empty.
-        if (len(clean_rows) > 1
-                and clean_rows[0][0]
-                and '\n' in clean_rows[0][0]
-                and all(c == '' for c in clean_rows[0][1:])):
-            clean_rows = clean_rows[1:]
 
         # Recover columns hidden outside the detected table bbox.
         # Threshold: only act if the extension is more than 5 pt.

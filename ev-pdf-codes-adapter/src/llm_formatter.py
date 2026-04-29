@@ -40,6 +40,14 @@ _REVISION_RE = re.compile(r'^\s*Revision:', re.IGNORECASE)
 # Pattern: 4-digit year, space, then all-caps word(s) only — short line
 _YEAR_MODEL_RE = re.compile(r'^\s*\d{4}\s+[A-Z][A-Z\s]+$')
 
+# Bare vehicle-name lines: "LEAF" printed alone at the top/bottom of a page.
+# Exact match only — does not touch DTC titles like "P0A0B LEAF SOMETHING".
+_BARE_MODEL_RE = re.compile(r'^\s*LEAF\s*$')
+
+# Section-banner lines injected by the manual layout: "< DTC/CIRCUIT DIAGNOSIS >"
+# These are structural dividers, not diagnostic content.
+_SECTION_BANNER_RE = re.compile(r'^\s*<\s*DTC/CIRCUIT DIAGNOSIS\s*>\s*$', re.IGNORECASE)
+
 # INFOID internal reference numbers — should be stripped by content_extractor
 # already, but kept here as a defence-in-depth fallback
 _INFOID_RE = re.compile(r'\bINFOID:\d+\b')
@@ -63,10 +71,12 @@ def _clean_text(text: str) -> str:
     """
     Strip noise lines and inline INFOID references from section text.
 
-    Noise removed:
+    Noise removed (standalone lines only — never mid-line edits):
       - standalone page-label lines  (EVB-88, TM-44)
       - Revision: lines
       - year-model suffix lines       (2013 LEAF)
+      - bare vehicle-name lines       (LEAF)
+      - section-banner lines          (< DTC/CIRCUIT DIAGNOSIS >)
       - INFOID:xxxxxxxx strings
     Blank-line runs of 3+ are collapsed to 2.
     """
@@ -81,6 +91,10 @@ def _clean_text(text: str) -> str:
         if _REVISION_RE.match(line):
             continue
         if _YEAR_MODEL_RE.match(line):
+            continue
+        if _BARE_MODEL_RE.match(line):
+            continue
+        if _SECTION_BANNER_RE.match(line):
             continue
         cleaned.append(line)
     result = re.sub(r'\n{3,}', '\n\n', '\n'.join(cleaned))
@@ -109,15 +123,20 @@ def _truncate_at_table_echo(text: str) -> str:
 
 # ── Section / table builders ───────────────────────────────────────────────────
 
-def _build_dtc_logic(sections: list, tables: list) -> dict | None:
+def _build_dtc_logic(sections: list, tables: list, table_groups: list) -> dict | None:
     """
     Build a flat dtc_logic block from section text + semantic_parse.
 
-    Output keys (all optional — only present when data exists):
+    Table source priority:
+      1. table_groups with role='dtc_logic'  (complete merged rows)
+      2. raw tables with role='dtc_logic'    (single-page fallback)
+
+    Always returns the same three keys (null when data is absent):
       confirmation_procedure  — cleaned DTC confirmation procedure steps
       detecting_condition     — shared fault-detection description
       possible_causes         — shared causes string
-      codes                   — list of {code, name} per DTC in this record
+    Returns None only when the record has no dtc_logic section and no
+    dtc_logic table at all (i.e. the block has no meaning for this record).
     """
     # ── Confirmation procedure text ──
     proc_text = None
@@ -130,73 +149,61 @@ def _build_dtc_logic(sections: list, tables: list) -> dict | None:
                 proc_text = truncated
             break  # only one dtc_logic section expected
 
-    # ── Structured DTC data from the best available table ──
-    sp = None
-    for t in tables:
-        if t.get('role') == 'dtc_logic':
-            candidate = t.get('semantic_parse', {})
-            if candidate.get('status') in ('ok', 'partial'):
-                sp = candidate
+    # ── Best available table source: group first, raw table fallback ──
+    best_table = None
+    for g in table_groups:
+        if g.get('role') == 'dtc_logic':
+            best_table = g
+            break
+    if best_table is None:
+        for t in tables:
+            if t.get('role') == 'dtc_logic':
+                best_table = t
                 break
 
-    if proc_text is None and sp is None:
+    sp = None
+    if best_table is not None:
+        candidate = best_table.get('semantic_parse', {})
+        if candidate.get('status') in ('ok', 'partial'):
+            sp = candidate
+
+    if proc_text is None and best_table is None:
         return None
 
-    result: dict = {}
+    detecting_condition = None
+    possible_causes     = None
 
-    if proc_text:
-        result['confirmation_procedure'] = proc_text
+    if sp and sp.get('table_type') == 'shared_fields':
+        shared = sp.get('shared', {})
 
-    if sp:
-        table_type = sp.get('table_type')
+        dc = (shared.get('dtc_detecting_condition')
+              or shared.get('detecting_condition'))
+        if dc:
+            detecting_condition = dc['value']
 
-        if table_type == 'shared_fields':
-            shared = sp.get('shared', {})
+        pc = (shared.get('possible_causes')
+              or shared.get('possible_cause'))
+        if pc:
+            possible_causes = pc['value']
 
-            # detecting_condition — try both slugified key variants
-            dc = (shared.get('dtc_detecting_condition')
-                  or shared.get('detecting_condition'))
-            if dc:
-                result['detecting_condition'] = dc['value']
-
-            # possible_causes — try both singular and plural
-            pc = (shared.get('possible_causes')
-                  or shared.get('possible_cause'))
-            if pc:
-                result['possible_causes'] = pc['value']
-
-            # per-code names
-            # For multi-code records: trouble_diagnosis_name lives in individual[].
-            # For single-code records: it lands in shared (confidence 1.0).
-            # Fall back to shared value so the name is never blank.
-            shared_name = (shared.get('trouble_diagnosis_name', {}) or {}).get('value', '')
-            individual = sp.get('individual', [])
-            if individual:
-                result['codes'] = [
-                    {
-                        'code': row.get('dtc', ''),
-                        'name': row.get('trouble_diagnosis_name') or shared_name,
-                    }
-                    for row in individual
-                ]
-
-        elif table_type == 'flat':
-            # Unusual for dtc_logic — include rows as-is
-            rows = sp.get('rows')
-            if rows:
-                result['table'] = rows
-
-    return result or None
+    return {
+        'confirmation_procedure': proc_text,
+        'detecting_condition':    detecting_condition,
+        'possible_causes':        possible_causes,
+        'raw_rows':               best_table.get('raw_rows') if best_table else None,
+    }
 
 
-def _build_diagnosis_procedure(sections: list, tables: list) -> dict | None:
+def _build_diagnosis_procedure(sections: list, tables: list, table_groups: list) -> dict | None:
     """
     Build a clean diagnosis_procedure block.
 
-    text   — section text with noise stripped (page labels, revision lines)
-    tables — one entry per diagnosis table:
-               {table_id, page_ref, table_type, ...semantic fields...}
-             raw_rows are excluded (they duplicate semantic_parse)
+    text        — section text with noise stripped (page labels, revision lines)
+    tables      — raw single-page tables not absorbed into any group
+    table_groups — merged multi-page tables (shown instead of their raw fragments)
+
+    Raw tables absorbed into a group are omitted from output.
+    Traceability to raw tables is preserved via group.source_table_ids.
     """
     proc_text = None
     for s in sections:
@@ -207,24 +214,56 @@ def _build_diagnosis_procedure(sections: list, tables: list) -> dict | None:
                 proc_text = cleaned
             break  # only one diagnosis_procedure section expected
 
+    # Build set of raw table_ids absorbed into a group — skip them in raw output
+    absorbed = {
+        tid
+        for g in table_groups
+        for tid in g.get('source_table_ids', [])
+    }
+
     proc_tables = []
+
+    # ── Raw standalone tables (not in any group) ──
     for t in tables:
         if t.get('role') != 'diagnosis_procedure':
             continue
-        sp = t.get('semantic_parse', {})
-        if sp.get('status') not in ('ok', 'partial'):
+        if t['table_id'] in absorbed:
             continue
 
-        # Include all semantic_parse fields except 'status' (ETL metadata,
-        # not useful for reasoning) and flatten together with table location.
         entry: dict = {
-            'table_id':   t['table_id'],
-            'page_ref':   t.get('page_ref'),
-            'table_type': sp.get('table_type'),
+            'table_id':       t['table_id'],
+            'start_pdf_page': t.get('start_pdf_page'),
+            'end_pdf_page':   t.get('end_pdf_page'),
+            'page_refs':      t.get('page_refs', []),
+            'raw_rows':       t.get('raw_rows'),
         }
-        for key, val in sp.items():
-            if key not in ('status', 'table_type'):
-                entry[key] = val
+        sp = t.get('semantic_parse', {})
+        if sp.get('status') in ('ok', 'partial'):
+            entry['table_type'] = sp.get('table_type')
+            for key, val in sp.items():
+                if key not in ('status', 'table_type'):
+                    entry[key] = val
+        proc_tables.append(entry)
+
+    # ── Table groups (merged multi-page tables) ──
+    for g in table_groups:
+        if g.get('role') != 'diagnosis_procedure':
+            continue
+
+        entry: dict = {
+            'group_id':         g['group_id'],
+            'source_table_ids': g.get('source_table_ids', []),
+            'start_pdf_page':   g.get('start_pdf_page'),
+            'end_pdf_page':     g.get('end_pdf_page'),
+            'page_refs':        g.get('page_refs', []),
+            'raw_rows':         g.get('raw_rows'),
+        }
+        sp = g.get('semantic_parse', {})
+        if sp.get('status') in ('ok', 'partial'):
+            entry['table_type'] = sp.get('table_type')
+            for key, val in sp.items():
+                if key not in ('status', 'table_type'):
+                    entry[key] = val
         proc_tables.append(entry)
 
     if proc_text is None and not proc_tables:
@@ -240,43 +279,36 @@ def _build_diagnosis_procedure(sections: list, tables: list) -> dict | None:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def format_record(record: dict, vehicle: dict | None = None) -> dict:
+def format_record(record: dict) -> dict:
     """
     Convert one schema v4 DTC record into a lean LLM-friendly dict.
 
     Parameters
     ----------
     record  : one element from ``v4_doc['records']``
-    vehicle : document-level ``vehicle`` block (optional — adds context)
 
     Returns
     -------
     New dict.  The original record is not modified.
     """
-    sections = record.get('sections', [])
-    tables   = record.get('tables', [])
-    images   = record.get('images', [])
+    sections     = record.get('sections', [])
+    tables       = record.get('tables', [])
+    table_groups = record.get('table_groups', [])
+    images       = record.get('images', [])
 
     out: dict = {
         'schema_version': '4-llm',
         'record_id':      record['record_id'],
         'codes':          record['codes'],
         'title':          record.get('title'),
-        'page_refs':      record.get('location', {}).get('page_refs', []),
+        'location':       record.get('location', {}),
     }
 
-    # Vehicle context from the document level — helps the LLM stay oriented
-    if vehicle:
-        v = {k: vehicle[k] for k in ('year', 'make', 'model', 'variant')
-             if vehicle.get(k)}
-        if v:
-            out['vehicle'] = v
-
-    dtc_block = _build_dtc_logic(sections, tables)
+    dtc_block = _build_dtc_logic(sections, tables, table_groups)
     if dtc_block:
         out['dtc_logic'] = dtc_block
 
-    diag_block = _build_diagnosis_procedure(sections, tables)
+    diag_block = _build_diagnosis_procedure(sections, tables, table_groups)
     if diag_block:
         out['diagnosis_procedure'] = diag_block
 
@@ -302,7 +334,7 @@ def format_document(doc: dict) -> dict:
     Both the document wrapper and every record are transformed.
     """
     vehicle = doc.get('vehicle')
-    records = [format_record(r, vehicle=vehicle) for r in doc.get('records', [])]
+    records = [format_record(r) for r in doc.get('records', [])]
 
     return {
         'schema_version': '4-llm',

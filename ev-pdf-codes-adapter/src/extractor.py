@@ -80,27 +80,38 @@ def _headers_match(row_a: list, row_b: list) -> bool:
     return strip_trailing(row_a) == strip_trailing(row_b)
 
 
-def _merge_continued_tables(tables: list, notes: list) -> list:
+def _merge_continued_tables(tables: list, notes: list, record_num: int) -> tuple[list, set]:
     """
-    Merge tables that continue across pages within the same section.
+    Detect cross-page table continuations and produce table_groups.
+
     Two consecutive tables are considered a continuation when they share
     the same section_id and matching header rows (_headers_match).
     The duplicate header row is dropped from the second table onward.
-    A note is appended to `notes` for each merge.
+
+    Changed role: no longer replaces raw tables.
+    Returns (table_groups, absorbed_ids) where:
+      - table_groups: one group dict per set of 2+ merged tables
+      - absorbed_ids: set of table_ids consumed into a group
+
+    Raw tables in `tables` are NOT modified.
+    Single-page tables that form no continuation produce no group.
     """
     if not tables:
-        return tables
+        return [], set()
 
-    merged = []
-    skip   = set()
+    groups   = []
+    absorbed = set()
+    g_count  = 1
+    skip     = set()
 
     for i, tbl in enumerate(tables):
         if i in skip:
             continue
 
-        combined     = dict(tbl)
-        combined["rows"] = list(tbl["rows"])
-        pages_merged = [tbl["page_ref"] or str(tbl["page"])]
+        source_ids  = [tbl["table_id"]]
+        merged_rows = list(tbl["rows"])
+        pages       = [tbl["page"]]
+        page_refs   = [tbl["page_ref"]] if tbl.get("page_ref") else []
 
         for j in range(i + 1, len(tables)):
             if j in skip:
@@ -109,20 +120,35 @@ def _merge_continued_tables(tables: list, notes: list) -> list:
             if (nxt["section_id"] == tbl["section_id"]
                     and nxt["rows"] and tbl["rows"]
                     and _headers_match(nxt["rows"][0], tbl["rows"][0])):
-                combined["rows"].extend(nxt["rows"][1:])
-                pages_merged.append(nxt["page_ref"] or str(nxt["page"]))
+                source_ids.append(nxt["table_id"])
+                merged_rows.extend(nxt["rows"][1:])
+                pages.append(nxt["page"])
+                if nxt.get("page_ref"):
+                    page_refs.append(nxt["page_ref"])
                 skip.add(j)
             else:
                 break   # only merge consecutive tables in the same section
 
-        if len(pages_merged) > 1:
+        if len(source_ids) > 1:
+            group_id = f"r{record_num}_g{g_count}"
+            for tid in source_ids:
+                absorbed.add(tid)
+            groups.append({
+                "group_id":         group_id,
+                "source_table_ids": source_ids,
+                "section_id":       tbl["section_id"],
+                "role":             tbl["role"],
+                "start_pdf_page":   pages[0],
+                "end_pdf_page":     pages[-1],
+                "page_refs":        page_refs,
+                "raw_rows":         merged_rows,
+            })
+            g_count += 1
             notes.append(
-                f"table {tbl['table_id']} continued across pages: {', '.join(pages_merged)}"
+                f"{group_id} merged {len(source_ids)} tables across pages: {', '.join(page_refs)}"
             )
 
-        merged.append(combined)
-
-    return merged
+    return groups, absorbed
 
 
 _DTC_CODE_RE = re.compile(r'^[A-Z][0-9A-Z]{4}$')      # e.g. P303D, P338A, P0A0D
@@ -707,16 +733,29 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
                 })
                 t_count += 1
 
-        # Merge tables that continue across pages (same section, same header row)
-        tables = _merge_continued_tables(tables, notes)
+        # Detect cross-page continuations → table_groups (raw tables unchanged)
+        table_groups, absorbed_ids = _merge_continued_tables(tables, notes, record_num)
 
-        # Convert each table's raw rows into semantic_parse.
-        # raw_rows is preserved exactly; semantic_parse holds the structured
-        # interpretation (carry-forward, named columns) when detectable.
+        # Finalize raw tables: rename location fields, pop rows → raw_rows.
+        # Semantic parse only for standalone tables not absorbed into a group.
         for tbl in tables:
-            raw = tbl.pop("rows")
+            raw    = tbl.pop("rows")
+            page   = tbl.pop("page")
+            pr     = tbl.pop("page_ref")
+            tbl["start_pdf_page"] = page
+            tbl["end_pdf_page"]   = page
+            tbl["page_refs"]      = [pr] if pr else []
             tbl["raw_rows"]       = raw
-            tbl["semantic_parse"] = _analyze_table(raw, role=tbl.get("role"), known_codes=set(codes))
+            if tbl["table_id"] not in absorbed_ids:
+                tbl["semantic_parse"] = _analyze_table(
+                    raw, role=tbl.get("role"), known_codes=set(codes)
+                )
+
+        # Semantic parse on table_groups (complete merged rows)
+        for grp in table_groups:
+            grp["semantic_parse"] = _analyze_table(
+                grp["raw_rows"], role=grp.get("role"), known_codes=set(codes)
+            )
 
         # ── Images — enriched with metadata ──────────────────────────────────
         images = []
@@ -744,10 +783,11 @@ def extract_records(pdf_path: Path, output_dir: Path) -> dict:
                 "page_refs":      page_refs,
             },
 
-            "sections": sections,
-            "tables":   tables,
-            "images":   images,
-            "notes":    notes,
+            "sections":     sections,
+            "tables":       tables,
+            "table_groups": table_groups,
+            "images":       images,
+            "notes":        notes,
 
             "raw_text": content["raw_text"],
 
