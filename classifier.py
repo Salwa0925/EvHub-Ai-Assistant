@@ -331,4 +331,4 @@ def run(raw_dir: str | Path = "raw", output_dir: str | Path = "classified") -> b
 
 
 if __name__ == "__main__":
-    run(raw_dir="raw", output_dir="classified")
+    run(raw_dir="raw", output_dir="classified") 

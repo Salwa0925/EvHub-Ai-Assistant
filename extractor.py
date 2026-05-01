@@ -288,4 +288,4 @@ def run(pdf_path: str | Path, output_dir: str | Path = "raw", cfg: Config | None
     if len(pending) < len(batches):
         log.info("Resuming - skipping %d completed batches", len(batches) - len(pending))
 
-    return all(_process_batch(pdf, s, e, out, convs, cfg) for s, e in pending)
+    return all(_process_batch(pdf, s, e, out, convs, cfg) for s, e in pending) 

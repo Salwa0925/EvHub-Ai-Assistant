@@ -52,7 +52,7 @@ def run(chunks_file: str | Path = "chunks.json") -> None:
 
     # ── Print summary ──────────────────────────────────────────────────────────
     total       = len(chunks)
-    procedures  = sum(1 for c in chunks if c.get("chunk_type") == "procedure")
+    procedures  = sum(1 for c in chunks if c.get("chunk_type") == "procedure") 
     precautions = sum(1 for c in chunks if c.get("chunk_type") == "precaution")
     hv          = sum(1 for c in chunks if c.get("safety_level") == "HIGH_VOLTAGE")
     with_prereq = sum(1 for c in chunks if c.get("prerequisites"))
