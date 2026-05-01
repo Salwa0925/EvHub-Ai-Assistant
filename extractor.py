@@ -1,3 +1,24 @@
+"""
+extractor.py — raw PDF extraction (text, tables, images)
+Output: raw/<start>_<end>.json  +  raw/images/*.png
+Next:   classifier.py reads these files
+
+Image strategy:
+  pymupdf handles ALL image extraction directly — both raster and vector.
+  For raster images: extracted directly from the PDF as-is.
+  For vector graphics: the containing region is rendered to PNG via clip rect.
+  Docling is NOT used for image detection — it misses vector graphics entirely.
+
+Page numbering:
+  Each page footer contains the manual page reference (e.g. EVC-11, GI-7).
+  pymupdf reads the footer in the same pass as image extraction.
+  Both pdf_page and manual_page are stamped on every element in the JSON.
+
+Table strategy:
+  TableFormer always runs — no conditional logic.
+  OCR only triggers on scanned pages (char count below threshold).
+"""
+
 from __future__ import annotations
 import gc, json, logging, re
 from dataclasses import dataclass
@@ -20,34 +41,30 @@ except ImportError:
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S", level=logging.INFO)
 log = logging.getLogger("extractor")
 
-# Matches manual page refs like EVC-11, GI-7, HA-3, BRC-22
 _MANUAL_PAGE_RE = re.compile(r"\b([A-Z]{1,5}-\d{1,4})\b")
 
 
 @dataclass
 class Config:
-    batch_size:         int   = 5
-    img_scale:          float = 1.0
-    page_render_dpi:    int   = 150
-    min_img_size:       int   = 50    # px — ignore tiny decorative images
-    ocr_threshold:      int   = 50
-    complex_table_cols: int   = 4
-    footer_height_pct:  float = 0.08  # bottom 8% of page = footer zone
+    batch_size:      int   = 5
+    img_scale:       float = 1.0
+    page_render_dpi: int   = 150
+    min_img_size:    int   = 50
+    ocr_threshold:   int   = 50
+    footer_height_pct: float = 0.08
 
 
-def _converter(*, ocr: bool, tableformer: bool, cfg: Config) -> DocumentConverter:
+def _converter(*, ocr: bool, cfg: Config) -> DocumentConverter:
     opts = PdfPipelineOptions()
     opts.do_ocr                  = ocr
-    opts.do_table_structure      = tableformer
+    opts.do_table_structure      = True   # always on
     opts.images_scale            = cfg.img_scale
     opts.generate_page_images    = False
     opts.generate_picture_images = False
     kw: dict[str, Any] = {"pipeline_options": opts}
     if _BACKEND:
         kw["backend"] = _BACKEND
-    return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(**kw)}
-    )
+    return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(**kw)})
 
 
 def _read_footer(page: fitz.Page, footer_height_pct: float) -> tuple[str | None, str | None, str | None]:
@@ -64,14 +81,6 @@ def _read_footer(page: fitz.Page, footer_height_pct: float) -> tuple[str | None,
 
 def _extract_page_pymupdf(pdf_path: Path, page_no: int,
                            image_dir: Path, cfg: Config) -> tuple[list[dict], str | None, str | None, str | None]:
-    """
-    Single pymupdf pass per page:
-      - Reads footer for manual page reference
-      - Extracts raster images (step 1)
-      - Extracts vector graphic regions (step 2)
-
-    Returns (images, manual_page, section_code)
-    """
     image_dir.mkdir(parents=True, exist_ok=True)
     images: list[dict] = []
     seen_rects: list[fitz.Rect] = []
@@ -81,10 +90,8 @@ def _extract_page_pymupdf(pdf_path: Path, page_no: int,
     zoom = cfg.page_render_dpi / 72
     mat  = fitz.Matrix(zoom, zoom)
 
-    # ── Footer: manual page reference ─────────────────────────────────────────
     manual_page, section_code, footer_text = _read_footer(page, cfg.footer_height_pct)
 
-    # ── Step 1: embedded raster images ────────────────────────────────────────
     for img_index, img in enumerate(page.get_images(full=True)):
         xref = img[0]
         try:
@@ -120,7 +127,6 @@ def _extract_page_pymupdf(pdf_path: Path, page_no: int,
             "type":         "raster",
         })
 
-    # ── Step 2: vector / drawing regions ──────────────────────────────────────
     blocks    = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES).get("blocks", [])
     vec_index = 0
     for block in blocks:
@@ -162,11 +168,6 @@ def _page(prov) -> int | None:
 
 
 def _extract_text_tables(result, page_map: dict[int, tuple]) -> tuple[list, list]:
-    """
-    Docling iterate_items() — text and tables only.
-    page_map: {pdf_page_no: (manual_page, section_code)} built during image pass.
-    Stamps manual_page and section_code onto every element.
-    """
     texts, tables = [], []
     for item, _ in result.document.iterate_items():
         prov   = getattr(item, "prov", [])
@@ -201,10 +202,6 @@ def _extract_text_tables(result, page_map: dict[int, tuple]) -> tuple[list, list
     return texts, tables
 
 
-def _needs_tableformer(tables: list, threshold: int) -> bool:
-    return any(t["num_cols"] >= threshold for t in tables)
-
-
 def _is_scanned(texts: list, threshold: int) -> bool:
     return sum(len(t["text"]) for t in texts) < threshold
 
@@ -213,8 +210,8 @@ def _process_batch(pdf: Path, s: int, e: int, out: Path, convs: dict, cfg: Confi
     try:
         # ── pymupdf pass: images + footer reading ──────────────────────────────
         image_dir = out / "images"
-        images:   list[dict]        = []
-        page_map: dict[int, tuple]  = {}   # {pdf_page: (manual_page, section_code)}
+        images:   list[dict]       = []
+        page_map: dict[int, tuple] = {}
 
         for page_no in range(s, e + 1):
             page_imgs, manual, code, footer_text = _extract_page_pymupdf(pdf, page_no, image_dir, cfg)
@@ -225,33 +222,18 @@ def _process_batch(pdf: Path, s: int, e: int, out: Path, convs: dict, cfg: Confi
             else:
                 log.warning("  page %d -> manual page ref not found in footer", page_no)
 
-        # ── Pass 1: text + layout, NO TableFormer, NO OCR ─────────────────────
-        log.info("Pass 1 (fast)  pages %d-%d", s, e)
-        res1 = convs["fast"].convert(str(pdf), page_range=(s, e))
-        texts, tables = _extract_text_tables(res1, page_map)
-        scanned = _is_scanned(texts, cfg.ocr_threshold)
+        # ── Docling: TableFormer always ON ─────────────────────────────────────
+        log.info("Extracting pages %d-%d (TableFormer ON)", s, e)
+        res = convs["tables_only"].convert(str(pdf), page_range=(s, e))
+        texts, tables = _extract_text_tables(res, page_map)
+        ran_ocr = False
 
-        ran_tableformer = False
-        ran_ocr         = False
-
-        # ── Pass 2: conditional ────────────────────────────────────────────────
-        if scanned:
-            log.info("  -> scanned, running OCR + TableFormer")
-            result = convs["ocr_tables"].convert(str(pdf), page_range=(s, e))
-            texts, tables = _extract_text_tables(result, page_map)
-            ran_ocr = ran_tableformer = True
-            del res1, result
-
-        elif _needs_tableformer(tables, cfg.complex_table_cols):
-            log.info("  -> complex tables, running TableFormer (no OCR)")
-            result = convs["tables_only"].convert(str(pdf), page_range=(s, e))
-            texts, tables = _extract_text_tables(result, page_map)
-            ran_tableformer = True
-            del res1, result
-
-        else:
-            log.info("  -> simple tables, Pass 1 sufficient")
-            del res1
+        # ── OCR fallback for scanned pages ─────────────────────────────────────
+        if _is_scanned(texts, cfg.ocr_threshold):
+            log.info("  -> scanned pages detected, re-running with OCR")
+            res = convs["ocr_tables"].convert(str(pdf), page_range=(s, e))
+            texts, tables = _extract_text_tables(res, page_map)
+            ran_ocr = True
 
         gc.collect()
 
@@ -264,7 +246,7 @@ def _process_batch(pdf: Path, s: int, e: int, out: Path, convs: dict, cfg: Confi
                     "page_start":       s,
                     "page_end":         e,
                     "ocr_used":         ran_ocr,
-                    "tableformer_used": ran_tableformer,
+                    "tableformer_used": True,
                     "page_map":         {str(k): list(v) for k, v in page_map.items()},
                 },
                 "text_elements": texts,
@@ -274,8 +256,8 @@ def _process_batch(pdf: Path, s: int, e: int, out: Path, convs: dict, cfg: Confi
             encoding="utf-8",
         )
 
-        log.info("  -> text=%d tables=%d images=%d  ocr=%s tableformer=%s",
-                 len(texts), len(tables), len(images), ran_ocr, ran_tableformer)
+        log.info("  -> text=%d tables=%d images=%d  ocr=%s",
+                 len(texts), len(tables), len(images), ran_ocr)
         gc.collect()
         return True
 
@@ -293,10 +275,10 @@ def run(pdf_path: str | Path, output_dir: str | Path = "raw", cfg: Config | None
     total = len(PdfReader(str(pdf)).pages)
     log.info("%s  -  %d pages", pdf.name, total)
 
+    # Two converters — TableFormer always on, OCR optional
     convs = {
-        "fast":        _converter(ocr=False, tableformer=False, cfg=cfg),
-        "tables_only": _converter(ocr=False, tableformer=True,  cfg=cfg),
-        "ocr_tables":  _converter(ocr=True,  tableformer=True,  cfg=cfg),
+        "tables_only": _converter(ocr=False, cfg=cfg),
+        "ocr_tables":  _converter(ocr=True,  cfg=cfg),
     }
 
     batches = [(s, min(s + cfg.batch_size - 1, total))
@@ -307,5 +289,3 @@ def run(pdf_path: str | Path, output_dir: str | Path = "raw", cfg: Config | None
         log.info("Resuming - skipping %d completed batches", len(batches) - len(pending))
 
     return all(_process_batch(pdf, s, e, out, convs, cfg) for s, e in pending)
-
-

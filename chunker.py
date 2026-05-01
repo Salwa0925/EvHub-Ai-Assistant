@@ -8,7 +8,13 @@ chunk_type values:
   precaution  — safety briefing pages, no numbered steps
   procedure   — numbered steps with optional warnings
   description — system description, component parts, no steps
-  spec        — service data and specifications tables only
+
+Key fixes:
+  - Tables assigned to ONE chunk only (first chunk that claims them)
+  - Cross-page tables merged before chunking — e.g. HA-34 and HA-35
+    are one logical table split across two pages
+  - Vehicle variant extracted cleanly from footer text
+  - Image ref codes cleaned from table cells
 """
 
 from __future__ import annotations
@@ -20,7 +26,8 @@ log = logging.getLogger("chunker")
 
 _PREREQ_RE    = re.compile(r"\b(before|prior to|ensure|verify|confirm|check that|must be)\b", re.IGNORECASE)
 _SAFETY_ORDER = {"HIGH_VOLTAGE": 3, "WARNING": 2, "CAUTION": 1, "NONE": 0}
-_VARIANT_RE   = re.compile(r"(\d{4}\s+leaf\s*\w*)", re.IGNORECASE)  # "2015 LEAF", "2015 Leaf NAM"
+_VARIANT_RE   = re.compile(r"\b(\d{4}\s+Leaf(?:\s+\w+)?)\b", re.IGNORECASE)
+_IMG_REF_INLINE = re.compile(r"\s*\b[A-Z]{2,5}\d{3,6}[A-Z]{0,3}\b")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -35,14 +42,6 @@ def _highest_safety(elements: list[dict]) -> str:
 
 
 def _detect_chunk_type(elements: list[dict]) -> str:
-    """
-    Determine what kind of chunk this is based on its content.
-
-    precaution  — only warnings, no procedure steps
-    procedure   — has at least one numbered procedure step
-    spec        — only tables, minimal text (service data pages)
-    description — everything else (system descriptions, component parts)
-    """
     types = [el.get("type") for el in elements]
     has_steps    = "procedure_step" in types
     has_warnings = "warning" in types or "warning_header" in types
@@ -56,45 +55,139 @@ def _detect_chunk_type(elements: list[dict]) -> str:
 
 
 def _extract_prerequisites(elements: list[dict]) -> list[str]:
-    """
-    Two sources of prerequisites:
-    1. Warning elements that appear BEFORE the first procedure_step —
-       these are the DANGER/WARNING blocks Nissan puts at the top of
-       every removal procedure (e.g. "Be sure to remove service plug...")
-    2. Any element in the first 5 whose text contains prerequisite language
-       (before/ensure/verify/confirm...)
-    """
     prereqs = []
     first_step_idx = next(
         (i for i, el in enumerate(elements) if el.get("type") == "procedure_step"),
         len(elements)
     )
-
-    # Warnings before first step are always prerequisites
     for el in elements[:first_step_idx]:
         if el.get("type") == "warning" and el["text"].strip() not in prereqs:
             prereqs.append(el["text"].strip())
-
-    # Prerequisite language in first 5 elements
     for el in elements[:5]:
         text = el.get("text", "")
         if _PREREQ_RE.search(text) and text.strip() not in prereqs:
             prereqs.append(text.strip())
-
     return prereqs
 
 
-def _extract_variant(page_map: dict) -> str | None:
-    """
-    Extract vehicle variant from page_map footer text.
-    e.g. "2015 LEAF", "2015 Leaf NAM"
-    """
+def _extract_variant(extraction: dict) -> str | None:
+    vehicle_raw = extraction.get("vehicle")
+    if vehicle_raw:
+        match = _VARIANT_RE.search(str(vehicle_raw))
+        if match:
+            return match.group(1).strip()
+    page_map = extraction.get("page_map", {})
     for val in page_map.values():
         if isinstance(val, list):
             for v in val:
-                if v and _VARIANT_RE.search(str(v)):
-                    return str(v).strip()
+                if v:
+                    match = _VARIANT_RE.search(str(v))
+                    if match:
+                        return match.group(1).strip()
     return None
+
+
+def _clean_table_cell(cell: str) -> str:
+    return _IMG_REF_INLINE.sub("", cell).strip()
+
+
+def _grid_to_markdown(grid: list[list[str]]) -> str:
+    """Build markdown string from grid — always reflects current data."""
+    if not grid:
+        return ""
+    header = "| " + " | ".join(grid[0]) + " |"
+    sep    = "| " + " | ".join(["---"] * len(grid[0])) + " |"
+    rows   = ["| " + " | ".join(row) + " |" for row in grid[1:]]
+    return "\n".join([header, sep] + rows)
+
+
+def _clean_table(table: dict) -> dict:
+    grid = table.get("data", [])
+    if not grid:
+        return table
+    cleaned = [[_clean_table_cell(cell) for cell in row] for row in grid]
+    return {
+        **table,
+        "data":     cleaned,
+        "num_rows": len(cleaned),
+        "markdown": _grid_to_markdown(cleaned),
+    }
+
+
+def _headers_match(row_a: list[str], row_b: list[str]) -> bool:
+    """
+    Check if two header rows are the same — used to detect cross-page tables.
+    Compares lowercased stripped values so minor whitespace differences don't matter.
+    """
+    if len(row_a) != len(row_b):
+        return False
+    return all(a.strip().lower() == b.strip().lower() for a, b in zip(row_a, row_b))
+
+
+def _merge_cross_page_tables(tables: list[dict]) -> list[dict]:
+    """
+    CROSS-PAGE TABLE MERGING — new function.
+
+    When a table is too tall to fit on one page, Docling extracts it as two
+    separate table objects — one per page. For example HA-34 and HA-35 are
+    one logical symptom table split across two pages.
+
+    Detection: two consecutive tables in the same section with matching
+    header rows. Adapted from coworker's DTC pipeline logic.
+
+    What it does:
+      - Loops through all tables in page order
+      - If the next table has the same section_code AND matching headers
+        → append its data rows (skipping its header) to the current table
+      - Records all page references the merged table spans
+      - Marks merged tables as used so they don't appear twice
+    """
+    if not tables:
+        return tables
+
+    merged = []
+    skip: set[int] = set()
+
+    for i, tbl in enumerate(tables):
+        if i in skip:
+            continue
+
+        combined = {**tbl}
+        combined["data"] = [row[:] for row in tbl.get("data", [])]
+        pages_merged = [tbl.get("page_manual") or str(tbl.get("page_pdf", ""))]
+
+        for j in range(i + 1, len(tables)):
+            if j in skip:
+                continue
+
+            nxt = tables[j]
+
+            # Must be same section and both must have data with matching headers
+            same_section = nxt.get("section_code") == tbl.get("section_code")
+            has_data     = bool(combined["data"]) and bool(nxt.get("data"))
+            headers_ok   = has_data and _headers_match(
+                combined["data"][0], nxt["data"][0]
+            )
+
+            if same_section and headers_ok:
+                # Append rows from next table, skipping its header row
+                combined["data"].extend(nxt["data"][1:])
+                pages_merged.append(nxt.get("page_manual") or str(nxt.get("page_pdf", "")))
+                combined["num_rows"] = len(combined["data"])
+                skip.add(j)
+            else:
+                break  # only merge consecutive tables
+
+        combined["pages_merged"] = pages_merged
+        combined["num_rows"]     = len(combined["data"])
+        combined["markdown"]     = _grid_to_markdown(combined["data"])
+        merged.append(combined)
+
+    if len(merged) < len(tables):
+        log.info("  merged %d cross-page tables → %d tables",
+                 len(tables), len(merged))
+
+    return merged
 
 
 def _chunk_id(section_code: str | None, page_pdf: int | None, index: int) -> str:
@@ -121,8 +214,8 @@ def _load_all(classified_dir: Path) -> tuple[list[dict], list[dict], list[dict],
         tables.extend(data.get("tables", []))
         images.extend(data.get("images", []))
         if not variant:
-            pm = data.get("extraction", {}).get("page_map", {})
-            variant = _extract_variant(pm)
+            extraction = data.get("extraction", {})
+            variant = _extract_variant(extraction)
 
     log.info("Loaded %d elements  %d tables  %d images  from %d batches  variant=%s",
              len(texts), len(tables), len(images), len(files), variant)
@@ -151,6 +244,9 @@ def _build_chunks(
     current_els:   list[dict] = []
     current_pages: set[int]   = set()
 
+    used_tables: set[tuple] = set()
+    used_images: set[tuple] = set()
+
     heading      = "PREAMBLE"
     section_code = None
     page_pdf     = None
@@ -161,9 +257,26 @@ def _build_chunks(
         if not current_els and not current_pages:
             return
 
-        chunk_tables = [t for pg in sorted(current_pages) for t in table_lookup.get(pg, [])]
-        chunk_images = [i for pg in sorted(current_pages) for i in image_lookup.get(pg, [])]
-        chunk_type   = _detect_chunk_type(current_els)
+        chunk_tables = []
+        for pg in sorted(current_pages):
+            for t in table_lookup.get(pg, []):
+                # Skip TOC tables — not useful for the agent
+                if t.get("table_type") == "toc":
+                    continue
+                t_key = (t.get("page_pdf"), str(t.get("bbox")))
+                if t_key not in used_tables:
+                    used_tables.add(t_key)
+                    chunk_tables.append(_clean_table(t))
+
+        chunk_images = []
+        for pg in sorted(current_pages):
+            for img in image_lookup.get(pg, []):
+                i_key = (img.get("page_pdf"), str(img.get("bbox")))
+                if i_key not in used_images:
+                    used_images.add(i_key)
+                    chunk_images.append(img)
+
+        chunk_type = _detect_chunk_type(current_els)
 
         chunks.append({
             "chunk_id":      _chunk_id(section_code, page_pdf, idx),
@@ -214,13 +327,17 @@ def run(
     if not texts:
         return False
 
+    # Merge cross-page tables BEFORE building page lookup
+    # This ensures HA-34 + HA-35 become one table before chunks are assigned
+    tables = _merge_cross_page_tables(tables)
+
     chunks = _build_chunks(texts, _page_lookup(tables), _page_lookup(images), variant)
 
-    hv         = sum(1 for c in chunks if c["safety_level"] == "HIGH_VOLTAGE")
-    w_tables   = sum(1 for c in chunks if c["tables"])
-    w_images   = sum(1 for c in chunks if c["images"])
-    w_prereq   = sum(1 for c in chunks if c["prerequisites"])
-    procedures = sum(1 for c in chunks if c["chunk_type"] == "procedure")
+    hv          = sum(1 for c in chunks if c["safety_level"] == "HIGH_VOLTAGE")
+    w_tables    = sum(1 for c in chunks if c["tables"])
+    w_images    = sum(1 for c in chunks if c["images"])
+    w_prereq    = sum(1 for c in chunks if c["prerequisites"])
+    procedures  = sum(1 for c in chunks if c["chunk_type"] == "procedure")
     precautions = sum(1 for c in chunks if c["chunk_type"] == "precaution")
 
     log.info(

@@ -26,14 +26,13 @@ log = logging.getLogger("main")
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Change these to match your setup
 
-PDF_FILE   = "PDF/ha.pdf"   # path to your PDF
+PDF_FILE   = "PDF/EVB.pdf"   # path to your PDF
 RAW_DIR    = "raw"                      # extractor output
 CLASSIFIED = "classified"               # classifier output
 CHUNKS     = "chunks.json"             # chunker output
 
 EXTRACTOR_CFG = ExtractorConfig(
     batch_size          = 5,      # lower to 3 if RAM is tight
-    complex_table_cols  = 4,
     page_render_dpi     = 150,
     min_img_size        = 50,
     footer_height_pct   = 0.08,

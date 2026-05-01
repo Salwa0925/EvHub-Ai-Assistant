@@ -6,7 +6,8 @@ Output: classified/*.json
 Four jobs:
   1. Filter noise (page-edge tabs, symbols, INFOID codes, breadcrumbs, variant tags)
   2. Merge split WARNING/CAUTION elements and tag every text element
-  3. Fix broken tables (forward-fill empty left columns)
+  3. Fix broken tables (forward-fill empty left columns, clean image refs)
+  4. Regenerate markdown from cleaned grid
 """
 
 from __future__ import annotations
@@ -43,6 +44,9 @@ _INFOID_RE    = re.compile(r"^INFOID:\d+$")
 _VARIANT_RE   = re.compile(r"^\[.{5,60}\]$")
 # Noise: breadcrumb tags e.g. < REMOVAL AND INSTALLATION >, < PRECAUTION >
 _BREADCRUMB_RE = re.compile(r"^<\s*.+\s*>$")
+# CHANGE 1: image reference codes — matches refs anywhere in a cell,
+# with or without leading whitespace e.g. "AC359A" or "...too high. AC360A AC356A"
+_IMG_REF_INLINE = re.compile(r"\s*\b[A-Z]{2,5}\d{3,6}[A-Z]{0,3}\b")
 
 
 # ── Noise filters ─────────────────────────────────────────────────────────────
@@ -108,9 +112,7 @@ def _process_texts(elements: list[dict]) -> list[dict]:
     """
     Pass 1 — classify every element.
     Pass 2 — merge warning_header + next element ONLY if next is not a
-             procedure_step. Fixes inline step warnings (EVB-200 pattern)
-             where a WARNING sits between numbered steps — merging would
-             incorrectly absorb the step into the warning body.
+             procedure_step.
     """
     classified = [_classify_text(el) for el in elements]
 
@@ -120,7 +122,6 @@ def _process_texts(elements: list[dict]) -> list[dict]:
         el = classified[i]
         if el["type"] == "warning_header" and i + 1 < len(classified):
             nxt = classified[i + 1]
-            # Only merge if the next element is NOT a procedure step
             if nxt["type"] != "procedure_step":
                 combined = f"{el['text'].strip()} {nxt['text'].strip()}"
                 merged.append({
@@ -132,7 +133,6 @@ def _process_texts(elements: list[dict]) -> list[dict]:
                 i += 2
                 continue
             else:
-                # Keep the warning_header as a standalone warning
                 merged.append({
                     **el,
                     "type":         "warning",
@@ -148,21 +148,88 @@ def _process_texts(elements: list[dict]) -> list[dict]:
 
 # ── Job 3: fix broken tables ──────────────────────────────────────────────────
 
+# CHANGE 2: threshold lowered from 0.4 to 0.2
+# Previously needed 40% of a column to be empty before forward-filling.
+# Symptom tables have only 2 empty cells out of 6 rows (33%) so 0.4 never
+# triggered. 0.2 catches any column where at least 1 in 5 cells is empty.
 def _forward_fill(grid: list[list[str]]) -> list[list[str]]:
+    """
+    Forward-fill AND backward-fill empty cells in label columns.
+
+    Forward-fill: copies value downward — handles merged cells where the
+    label appears in the first row of a group.
+
+    Backward-fill: copies value upward — handles merged cells where the
+    label appears AFTER the empty rows (e.g. gauge diagram image sits above
+    the symptom text in the PDF, so TableFormer sees empty cell first).
+
+    Header row (index 0) is always skipped.
+    """
     if not grid:
         return grid
     filled  = [row[:] for row in grid]
+    data    = filled[1:]   # skip header for all operations
     n_cols  = len(filled[0])
+
     for col in range(n_cols - 1):
-        empty_count = sum(1 for row in filled if not row[col].strip())
-        if empty_count / len(filled) > 0.4:
-            last_val = ""
-            for row in filled:
-                if row[col].strip():
-                    last_val = row[col]
-                else:
-                    row[col] = last_val
+        empty_count = sum(1 for row in data if not row[col].strip())
+        if not data or empty_count / len(data) <= 0.2:
+            continue
+
+        # Forward pass — top to bottom
+        last_val = ""
+        for row in data:
+            if row[col].strip():
+                last_val = row[col]
+            else:
+                row[col] = last_val
+
+        # Backward pass — bottom to top
+        # Fills any remaining empty cells that came before the first value
+        last_val = ""
+        for row in reversed(data):
+            if row[col].strip():
+                last_val = row[col]
+            elif last_val:
+                row[col] = last_val
+
     return filled
+
+
+# CHANGE 3: uses .sub() instead of .match() so refs are stripped from
+# anywhere in the cell — not just when the whole cell is a ref code.
+def _clean_img_refs(grid: list[list[str]]) -> list[list[str]]:
+    """Remove image reference codes from anywhere in table cells."""
+    return [
+        [_IMG_REF_INLINE.sub("", cell).strip() for cell in row]
+        for row in grid
+    ]
+
+
+# CHANGE 4: new function — builds markdown from the cleaned grid.
+# Previously we kept Docling's original markdown string which still showed
+# dirty data (AC359A etc.) even after the grid was cleaned.
+# Now markdown is always regenerated from whatever is in data after all fixes.
+def _grid_to_markdown(grid: list[list[str]]) -> str:
+    if not grid:
+        return ""
+    header = "| " + " | ".join(grid[0]) + " |"
+    sep    = "| " + " | ".join(["---"] * len(grid[0])) + " |"
+    rows   = ["| " + " | ".join(row) + " |" for row in grid[1:]]
+    return "\n".join([header, sep] + rows)
+
+
+def _is_toc(grid: list[list[str]]) -> bool:
+    """
+    Detect table of contents tables.
+    TOC tables have dotted page references in the second column
+    e.g. "............19", "...........20" or empty strings.
+    If more than 50% of rows match this pattern it is a TOC.
+    """
+    if not grid or len(grid[0]) < 2:
+        return False
+    dot_count = sum(1 for row in grid if len(row) > 1 and ("..." in row[1] or row[1].strip() == ""))
+    return dot_count / len(grid) > 0.5
 
 
 def _process_tables(tables: list[dict]) -> list[dict]:
@@ -172,6 +239,14 @@ def _process_tables(tables: list[dict]) -> list[dict]:
         if not grid:
             result.append({**table, "table_type": "empty"})
             continue
+
+        # Detect and tag TOC tables — skip cleaning and filling
+        if _is_toc(grid):
+            result.append({**table, "table_type": "toc"})
+            continue
+
+        # Step 1 — clean image refs from cells
+        grid = _clean_img_refs(grid)
 
         first_col = [row[0].strip() for row in grid if row]
         is_index  = all(len(v) <= 3 or v == "" for v in first_col)
@@ -185,14 +260,15 @@ def _process_tables(tables: list[dict]) -> list[dict]:
             fixed_grid = _forward_fill(grid)
         else:
             table_type = "general"
-            fixed_grid = grid
+            has_empty_first_col = any(not row[0].strip() for row in grid[1:])
+            fixed_grid = _forward_fill(grid) if has_empty_first_col else grid
 
         result.append({
             **table,
             "table_type": table_type,
             "data":       fixed_grid,
-            "data_raw":   grid,
-            "markdown":   table.get("markdown", ""),
+            "data_raw":   table.get("data", []),
+            "markdown":   _grid_to_markdown(fixed_grid),
         })
     return result
 
@@ -203,7 +279,6 @@ def classify_batch(raw_path: Path, out_dir: Path) -> bool:
     try:
         raw = json.loads(raw_path.read_text(encoding="utf-8"))
 
-        # Job 1: filter all noise in one pass
         elements = [
             el for el in raw.get("text_elements", [])
             if not _is_noise(el)
